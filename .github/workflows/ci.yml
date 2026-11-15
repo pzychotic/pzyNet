@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cmake --preset msvc
+      - run: cmake --build --preset msvc-debug
+      - run: ctest --preset msvc-debug
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        preset: [gcc-debug, gcc-release, clang-debug]
+    steps:
+      - uses: actions/checkout@v7
+      - run: cmake --preset ${{ matrix.preset }} -DPZYNET_WARNINGS_AS_ERRORS=ON
+      - run: cmake --build --preset ${{ matrix.preset }} -j
+      - run: ctest --preset ${{ matrix.preset }}

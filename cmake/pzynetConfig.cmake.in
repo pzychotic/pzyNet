@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/pzynetTargets.cmake")
+
+# Components are the layer names: core, socket, transport, raknet.
+foreach(component ${pzynet_FIND_COMPONENTS})
+    if(NOT TARGET pzynet::${component})
+        set(pzynet_${component}_FOUND FALSE)
+        if(pzynet_FIND_REQUIRED_${component})
+            set(pzynet_FOUND FALSE)
+            set(pzynet_NOT_FOUND_MESSAGE "pzynet has no component '${component}'")
+        endif()
+    else()
+        set(pzynet_${component}_FOUND TRUE)
+    endif()
+endforeach()

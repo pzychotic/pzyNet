@@ -1,0 +1,35 @@
+#pragma once
+
+#include "pzynet/core/address.hpp"
+#include "pzynet/core/error.hpp"
+
+#include <cstdint>
+#include <string_view>
+#include <system_error>
+#include <vector>
+
+namespace pzynet
+{
+
+enum class ResolveFamily
+{
+    any,
+    v4,
+    v6
+};
+
+/// Resolves a host name (or address literal) with the system resolver. Blocks.
+/// An unknown host reports Errc::host_not_found and yields an empty list.
+std::vector<Endpoint> resolve(std::string_view host, std::uint16_t port, ResolveFamily family,
+                              std::error_code& ec);
+
+inline std::vector<Endpoint> resolve(std::string_view host, std::uint16_t port,
+                                     ResolveFamily family = ResolveFamily::any)
+{
+    std::error_code ec;
+    std::vector<Endpoint> endpoints = resolve(host, port, family, ec);
+    detail::throw_if(ec, "resolve");
+    return endpoints;
+}
+
+} // namespace pzynet

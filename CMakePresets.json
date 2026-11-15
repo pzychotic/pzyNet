@@ -1,0 +1,60 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "msvc",
+            "displayName": "Windows / Visual Studio (multi-config)",
+            "binaryDir": "${sourceDir}/build/msvc",
+            "architecture": "x64",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        },
+        {
+            "name": "gcc-debug",
+            "inherits": "linux-base",
+            "binaryDir": "${sourceDir}/build/gcc-debug",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CMAKE_CXX_COMPILER": "g++" }
+        },
+        {
+            "name": "gcc-release",
+            "inherits": "linux-base",
+            "binaryDir": "${sourceDir}/build/gcc-release",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_CXX_COMPILER": "g++" }
+        },
+        {
+            "name": "clang-debug",
+            "inherits": "linux-base",
+            "binaryDir": "${sourceDir}/build/clang-debug",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CMAKE_CXX_COMPILER": "clang++" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "msvc-debug", "configurePreset": "msvc", "configuration": "Debug" },
+        { "name": "msvc-release", "configurePreset": "msvc", "configuration": "Release" },
+        { "name": "gcc-debug", "configurePreset": "gcc-debug" },
+        { "name": "gcc-release", "configurePreset": "gcc-release" },
+        { "name": "clang-debug", "configurePreset": "clang-debug" }
+    ],
+    "testPresets": [
+        {
+            "name": "msvc-debug",
+            "configurePreset": "msvc",
+            "configuration": "Debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "msvc-release",
+            "configurePreset": "msvc",
+            "configuration": "Release",
+            "output": { "outputOnFailure": true }
+        },
+        { "name": "gcc-debug", "configurePreset": "gcc-debug", "output": { "outputOnFailure": true } },
+        { "name": "gcc-release", "configurePreset": "gcc-release", "output": { "outputOnFailure": true } },
+        { "name": "clang-debug", "configurePreset": "clang-debug", "output": { "outputOnFailure": true } }
+    ]
+}

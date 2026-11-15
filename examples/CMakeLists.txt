@@ -1,0 +1,9 @@
+function(pzynet_add_example name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE ${ARGN})
+    pzynet_configure_target(${name})
+endfunction()
+
+pzynet_add_example(udp_echo pzynet::socket)
+pzynet_add_example(tcp_echo pzynet::socket)
+pzynet_add_example(raknet_chat pzynet::transport pzynet::raknet)
