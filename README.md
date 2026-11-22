@@ -106,7 +106,8 @@ Payloads must not start with an id the protocol consumes itself; `send()` reject
 
 `raknet::BitStreamWriter` and `raknet::BitStreamReader` read and write RakNet's BitStream format bit for
 bit: values are packed most significant bit first with no regard for byte boundaries, a `bool` takes one
-bit, and integers of every width are written in the stream's byte order. That is big-endian by default,
+bit, and integers and enums of every width, `float` and `double` are written in the stream's byte order.
+That is big-endian by default,
 as in stock RakNet; pass `raknet::ByteOrder::little_endian` to talk to a RakNet build with
 `__BITSTREAM_NATIVE_END`.
 
@@ -127,6 +128,23 @@ if (!in.ok()) { /* the message was too short */ }
 
 The writer owns its buffer (`data()`, `bit_count()`); the reader is a non-owning view. A read past the
 end returns zero and latches `ok() == false`, so a message can be read in full and checked once.
+
+Beyond scalars: `write_bits()` / `read_bits()` take raw bits (with RakNet's right-aligned tail by default),
+`write_bytes()` and `write_aligned_bytes()` raw bytes, `align()` pads to a byte boundary, and the reader
+can `skip_bits()` / `skip_bytes()`. Your own types go through the stream once you declare free functions
+next to them, found by argument-dependent lookup:
+
+```cpp
+namespace game
+{
+struct Position { std::int16_t x; float y; };
+void write(raknet::BitStreamWriter& out, const Position& p) { out.write(p.x); out.write(p.y); }
+void read(raknet::BitStreamReader& in, Position& p) { in.read(p.x); in.read(p.y); }
+}
+
+out.write(game::Position{3, 1.5f});
+game::Position p = in.read<game::Position>(); // or: in.read(p) returns ok()
+```
 
 ## Peer
 
