@@ -41,7 +41,10 @@ Consume it with `add_subdirectory`/`FetchContent`, or install it and use
 
 Every fallible call exists twice: `f(args)` throws `std::system_error`; `f(args, std::error_code&)` never
 throws. Operating-system errors keep their native code; a non-blocking call that cannot complete reports
-`std::errc::operation_would_block` on both platforms. Library-specific conditions are `pzynet::Errc`.
+`std::errc::operation_would_block` on both platforms. Library-specific conditions are `pzynet::Errc`:
+a configuration value over its limit (a password, an offline ping response) is `Errc::invalid_argument`,
+data to be sent over its limit is `Errc::message_too_large`, and a call on a Peer that is not running is
+`Errc::not_open`.
 
 ## Sockets
 
@@ -184,6 +187,13 @@ network on a background thread (or, with `Threading::app_driven`, whenever you c
 Everything it has to report arrives through `receive()` as a `raknet::Packet`, named by its RakNet
 message id, so a program dispatches on the first byte as RakNet programs do.
 
+On Windows, short waits are rounded up to the system timer tick, about 15.6 ms by default. An app-driven
+loop that calls `update(1ms)` then runs the network far less often than it asks for, and an unreliable
+send with an acknowledgement receipt can be reported lost (`id::snd_receipt_loss`) although it arrived,
+because its receipt deadline passes before the acknowledgement is processed. RakNet behaves the same.
+Raise the timer resolution with `timeBeginPeriod(1)` (winmm) for the life of the loop, as real-time
+applications do; the tests do so too.
+
 ```cpp
 #include "pzynet/rakpeer/peer.hpp"
 
@@ -230,11 +240,15 @@ for (;;) {
   `advertise(endpoint, data)` arrives as `id::advertise_system`. `set_max_incoming_connections()` and
   `set_incoming_password()` change those settings while running.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
-  `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+  `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally; messages
+  already received from that system are still delivered. Disconnecting a system that is not connected
+  fails with `Errc::not_connected`.
 - `ban(address, duration)` refuses an IPv4 address (`"192.168.*"` wildcards allowed; zero duration
   bans permanently) with `id::connection_banned`; `unban()`, `clear_bans()` and `is_banned()` complete
   RakNet's ban list. `set_limit_ip_connection_frequency(true)` (or `PeerConfig::engine`) refuses an IP
-  that connected less than 100 ms before with `id::ip_recently_connected`.
+  that connected less than 100 ms before with `id::ip_recently_connected`. As in RakNet, this host's
+  own addresses are exempt: those its host name resolves to, a specific bound address, and the external
+  address the first handshake reported (`RakNetEngine` takes the local ones as `Config::local_addresses`).
 - `statistics(remote)` returns a `raknet::ConnectionStats` for a connected remote: bytes and messages
   sent and received, resent datagrams, datagrams presumed lost, and the send queue in messages and bytes
   (the engine offers the same through `RakNetEngine::connection_stats()`). It is a small diagnostic
