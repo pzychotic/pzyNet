@@ -22,9 +22,10 @@ add_executable(pzynet_tests
     transport/udp_host_test.cpp
     raknet/bit_stream_test.cpp
     raknet/wire_test.cpp
-    raknet/engine_test.cpp)
+    raknet/engine_test.cpp
+    rakpeer/peer_test.cpp)
 target_link_libraries(pzynet_tests PRIVATE
-    pzynet::core pzynet::socket pzynet::transport pzynet::raknet Catch2::Catch2WithMain)
+    pzynet::core pzynet::socket pzynet::transport pzynet::raknet pzynet::rakpeer Catch2::Catch2WithMain)
 target_include_directories(pzynet_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 pzynet_configure_target(pzynet_tests)
 catch_discover_tests(pzynet_tests PROPERTIES TIMEOUT 120)

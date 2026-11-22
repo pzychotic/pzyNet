@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 
 namespace pzynet
 {
@@ -10,5 +11,8 @@ namespace pzynet
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 using Duration = Clock::duration;
+
+/// Where a driver takes the current time from; an empty source means Clock::now().
+using ClockSource = std::function<TimePoint()>;
 
 } // namespace pzynet
