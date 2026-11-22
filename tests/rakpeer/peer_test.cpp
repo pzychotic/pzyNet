@@ -535,12 +535,23 @@ TEST_CASE("Peer: an advertisement arrives as a Packet without a connection", "[r
 namespace
 {
 
-/// A UDP socket posing as a server: it answers a Peer's first connection request with `reply`.
-void refuse_first_request(UdpSocket& server, const std::vector<std::uint8_t>& reply)
+/// A UDP socket posing as a server: it answers a Peer's first connection request with `reply`. Pumps the
+/// network while it waits, so an app-driven Peer gets to send that request.
+void refuse_first_request(Network& net, UdpSocket& server, const std::vector<std::uint8_t>& reply)
 {
+    server.set_non_blocking(true);
     std::vector<std::uint8_t> buffer(2048);
     Endpoint from;
-    server.receive_from(buffer, from); // the Peer's ID_OPEN_CONNECTION_REQUEST_1
+    std::error_code ec;
+    const auto give_up = SteadyClock::now() + 5s;
+    for (;;)
+    {
+        server.receive_from(buffer, from, ec); // the Peer's ID_OPEN_CONNECTION_REQUEST_1
+        if (!ec || SteadyClock::now() >= give_up)
+            break;
+        net.pump();
+    }
+    REQUIRE_FALSE(ec);
     server.send_to(reply, from);
 }
 
@@ -563,6 +574,7 @@ std::uint64_t header_time(const std::vector<std::uint8_t>& data)
 
 TEST_CASE("Peer: each refusal from the server arrives as RakNet's id for it", "[rakpeer]")
 {
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
     const std::uint64_t server_guid = 0x1122334455667788ull;
     std::vector<std::uint8_t> reply;
     std::uint8_t expected = 0;
@@ -615,13 +627,13 @@ TEST_CASE("Peer: each refusal from the server arrives as RakNet's id for it", "[
     UdpSocket server;
     server.open(IpAddress::Family::v4);
     server.bind(Endpoint(IpAddress::loopback_v4(), 0));
-    Peer client;
-    client.start(loopback_config());
+    Network net;
+    Peer& client = net.add(loopback_config(threading));
 
     client.connect(server.local_endpoint());
-    refuse_first_request(server, reply);
+    refuse_first_request(net, server, reply);
 
-    const std::optional<Packet> packet = wait_for_packet(client);
+    const std::optional<Packet> packet = net.wait_for_packet(client);
     REQUIRE(packet);
     CHECK(packet->id == expected);
     std::vector<std::uint8_t> expected_data(expected_size, 0);
@@ -632,18 +644,19 @@ TEST_CASE("Peer: each refusal from the server arrives as RakNet's id for it", "[
 
 TEST_CASE("Peer: a server that never answers fails the attempt", "[rakpeer]")
 {
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
     UdpSocket silent;
     silent.open(IpAddress::Family::v4);
     silent.bind(Endpoint(IpAddress::loopback_v4(), 0));
-    PeerConfig config = loopback_config();
+    PeerConfig config = loopback_config(threading);
     config.engine.connect_attempts = 3;
     config.engine.connect_attempt_interval = 50ms;
-    Peer client;
-    client.start(config);
+    Network net;
+    Peer& client = net.add(config);
 
     client.connect(silent.local_endpoint());
 
-    const std::optional<Packet> packet = wait_for_packet(client);
+    const std::optional<Packet> packet = net.wait_for_packet(client);
     REQUIRE(packet);
     CHECK(packet->id == id::connection_attempt_failed);
     CHECK(packet->address == silent.local_endpoint());
@@ -651,50 +664,45 @@ TEST_CASE("Peer: a server that never answers fails the attempt", "[rakpeer]")
 
 TEST_CASE("Peer: an incoming password admits the right one and refuses a wrong one", "[rakpeer]")
 {
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
     const std::string secret = "open sesame";
     const std::vector<std::uint8_t> secret_bytes(secret.begin(), secret.end());
-    PeerConfig server_config = loopback_config(4);
+    PeerConfig server_config = loopback_config(threading, 4);
     server_config.engine.incoming_password = secret_bytes;
-    Peer server;
-    server.start(server_config);
+    Network net;
+    Peer& server = net.add(server_config);
 
-    Peer right;
-    right.start(loopback_config());
+    Peer& right = net.add(loopback_config(threading));
     right.connect(server.local_endpoint(), secret_bytes);
-    const std::optional<Packet> accepted = wait_for_packet(right);
+    const std::optional<Packet> accepted = net.wait_for_packet(right);
     REQUIRE(accepted);
     CHECK(accepted->id == id::connection_request_accepted);
-    const std::optional<Packet> incoming = wait_for_packet(server);
+    const std::optional<Packet> incoming = net.wait_for_packet(server);
     REQUIRE(incoming);
     CHECK(incoming->id == id::new_incoming_connection);
 
-    Peer wrong;
-    wrong.start(loopback_config());
+    Peer& wrong = net.add(loopback_config(threading));
     wrong.connect(server.local_endpoint(), std::vector<std::uint8_t>{'n', 'o'});
-    const std::optional<Packet> refused = wait_for_packet(wrong);
+    const std::optional<Packet> refused = net.wait_for_packet(wrong);
     REQUIRE(refused);
     CHECK(refused->id == id::invalid_password);
     CHECK(refused->address == server.local_endpoint());
-    CHECK_FALSE(wait_for_packet(server, 300ms));
+    CHECK_FALSE(net.wait_for_packet(server, 300ms));
 }
 
 TEST_CASE("Peer: a remote that goes silent arrives as a lost connection", "[rakpeer]")
 {
-    Peer server;
-    server.start(loopback_config(4));
-    PeerConfig config = loopback_config();
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    PeerConfig config = loopback_config(threading);
     config.engine.timeout = 500ms;
-    Peer client;
-    client.start(config);
-    client.connect(server.local_endpoint());
-    REQUIRE(wait_for_packet(client));
-    REQUIRE(wait_for_packet(server));
+    Network net;
+    auto [server, client] = net.connected_pair(loopback_config(threading, 4), config);
     const Guid server_guid = server.guid();
     const Endpoint server_address = server.local_endpoint();
 
     server.shutdown(); // no notification reaches the client
 
-    const std::optional<Packet> packet = wait_for_packet(client, 10s);
+    const std::optional<Packet> packet = net.wait_for_packet(client, 10s);
     REQUIRE(packet);
     CHECK(packet->id == id::connection_lost);
     CHECK(packet->guid == server_guid);
@@ -703,14 +711,14 @@ TEST_CASE("Peer: a remote that goes silent arrives as a lost connection", "[rakp
 
 TEST_CASE("Peer: connecting by host name resolves to the first IPv4 address", "[rakpeer]")
 {
-    Peer server;
-    server.start(loopback_config(4));
-    Peer client;
-    client.start(loopback_config());
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    Network net;
+    Peer& server = net.add(loopback_config(threading, 4));
+    Peer& client = net.add(loopback_config(threading));
 
     client.connect("localhost", server.local_endpoint().port());
 
-    const std::optional<Packet> accepted = wait_for_packet(client);
+    const std::optional<Packet> accepted = net.wait_for_packet(client);
     REQUIRE(accepted);
     CHECK(accepted->id == id::connection_request_accepted);
     CHECK(accepted->address == server.local_endpoint());
@@ -718,15 +726,16 @@ TEST_CASE("Peer: connecting by host name resolves to the first IPv4 address", "[
 
 TEST_CASE("Peer: a host name that does not resolve is an error from connect", "[rakpeer]")
 {
-    Peer client;
-    client.start(loopback_config());
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    Network net;
+    Peer& client = net.add(loopback_config(threading));
     const std::string name = "no-such-host.invalid";
 
     std::error_code ec;
     client.connect(name, 1234, ByteView(), ec);
     CHECK(ec == Errc::host_not_found);
     CHECK_THROWS_AS(client.connect(name, 1234), std::system_error);
-    CHECK_FALSE(wait_for_packet(client, 300ms));
+    CHECK_FALSE(net.wait_for_packet(client, 300ms));
 }
 
 TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clock", "[rakpeer]")
