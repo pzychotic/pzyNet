@@ -147,6 +147,13 @@ out.write(game::Position{3, 1.5f});
 game::Position p = in.read<game::Position>(); // or: in.read(p) returns ok()
 ```
 
+RakNet's space-saving encodings have their own calls, each with a matching read: `write_compressed()`
+(integers without their zero bytes, floats and doubles in [-1, 1] as 16 and 32 bits), `write_delta()` and
+`write_compressed_delta()` (one bit for an unchanged value), `write_float16(value, min, max)` and
+`write_ranged(value, min, max)` (the fewest bits that hold `max - min`). They reproduce RakNet's bytes
+exactly, quirks included: in a big-endian stream a compressed integer drops *trailing* zero bytes, so
+small numbers only shrink in little-endian streams, and negative numbers are never shortened.
+
 ## Peer
 
 `raknet::Peer` is a RakNet endpoint in a few lines: it owns the socket and the RakNet engine and runs the
