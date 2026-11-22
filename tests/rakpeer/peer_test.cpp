@@ -359,20 +359,16 @@ std::uint64_t header_time(const std::vector<std::uint8_t>& data)
 TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clock", "[rakpeer]")
 {
     // One side's clock runs an hour ahead, so an unconverted time would be an hour off.
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
     const bool skew_sender = GENERATE(true, false);
     INFO((skew_sender ? "sender's clock is ahead" : "receiver's clock is ahead"));
     const ClockSource ahead = [] { return Clock::now() + 1h; };
 
-    PeerConfig server_config = loopback_config(4);
-    PeerConfig client_config = loopback_config();
+    PeerConfig server_config = loopback_config(threading, 4);
+    PeerConfig client_config = loopback_config(threading);
     (skew_sender ? client_config : server_config).clock = ahead;
-    Peer server;
-    server.start(server_config);
-    Peer client;
-    client.start(client_config);
-    client.connect(server.local_endpoint());
-    REQUIRE(wait_for_packet(client));
-    REQUIRE(wait_for_packet(server));
+    Network net;
+    auto [server, client] = net.connected_pair(server_config, client_config);
 
     const std::int64_t skew = time_difference(client.time(), server.time());
     CHECK(std::abs(skew - (skew_sender ? 3'600'000 : -3'600'000)) <= 50);
@@ -385,7 +381,7 @@ TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clo
     message.write(std::uint32_t{0xC0FFEE});
     client.send(server.guid(), message);
 
-    const std::optional<Packet> packet = wait_for_packet(server);
+    const std::optional<Packet> packet = net.wait_for_packet(server);
     REQUIRE(packet);
     const std::uint64_t received_at = server.time();
     REQUIRE(packet->timestamp);
@@ -408,20 +404,16 @@ TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clo
 
 TEST_CASE("Peer: a timestamped message with a truncated header is delivered unmodified", "[rakpeer]")
 {
-    PeerConfig client_config = loopback_config();
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    PeerConfig client_config = loopback_config(threading);
     client_config.clock = [] { return Clock::now() + 1h; }; // any conversion would change the bytes
-    Peer server;
-    server.start(loopback_config(4));
-    Peer client;
-    client.start(client_config);
-    client.connect(server.local_endpoint());
-    REQUIRE(wait_for_packet(client));
-    REQUIRE(wait_for_packet(server));
+    Network net;
+    auto [server, client] = net.connected_pair(loopback_config(threading, 4), client_config);
 
     const std::vector<std::uint8_t> truncated{id::timestamp, 1, 2, 3, 4, 5, 6, 7};
     client.send(server.guid(), truncated);
 
-    const std::optional<Packet> packet = wait_for_packet(server);
+    const std::optional<Packet> packet = net.wait_for_packet(server);
     REQUIRE(packet);
     CHECK(packet->id == id::timestamp);
     CHECK(packet->data == truncated);

@@ -173,8 +173,10 @@ for (;;) {
   receipt number.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
-- `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
-  anyone.
+- `shutdown(linger)` with a positive linger closes every connection gracefully and waits, at most
+  that long, until the remote systems have acknowledged the pending reliable data and their
+  disconnection notification (in either threading mode). `shutdown()` with zero linger, and the
+  destructor, stop at once without notifying anyone; the remotes see a lost connection.
 - Timestamped messages work as in RakPeer: send `id::timestamp`, `peer.time()` (8 bytes) and then the
   real message id. On receipt the time is converted into the receiver's clock using the connection's
   measured clock offset; it is rewritten in the data and available as `packet->timestamp`, and
