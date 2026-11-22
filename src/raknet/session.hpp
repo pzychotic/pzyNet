@@ -94,6 +94,8 @@ public:
     bool acks_pending() const noexcept { return !acks_.empty(); }
     TimePoint last_reliable_send() const noexcept { return last_reliable_send_; }
     std::size_t mtu() const noexcept { return config_.mtu; }
+    Duration timeout() const noexcept { return config_.timeout; }
+    void set_timeout(Duration timeout) noexcept { config_.timeout = timeout; }
     /// Smoothed round-trip time, once at least one acknowledgement arrived.
     std::optional<Duration> rtt() const;
 

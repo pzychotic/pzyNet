@@ -2,6 +2,7 @@
 
 #include "pzynet/core/address.hpp"
 #include "pzynet/core/clock.hpp"
+#include "pzynet/core/error.hpp"
 #include "pzynet/transport/engine.hpp"
 
 #include <chrono>
@@ -56,6 +57,11 @@ struct ConnectionInfo
     /// Estimated (remote clock - local clock) in RakNet time; nullopt until measured.
     /// Subtract it from a remote ID_TIMESTAMP value to express it in local time (see wire_time()).
     std::optional<std::chrono::milliseconds> clock_offset;
+    /// How long reliable data may stay unacknowledged before the connection is dropped.
+    std::chrono::milliseconds timeout{0};
+    /// This side's address as the remote system reported it during the handshake (RakNet's
+    /// GetExternalID); nullopt until the handshake delivered it.
+    std::optional<Endpoint> external_address;
 };
 
 /// The RakNet 4.x wire protocol (protocol version 6) as a transport::Engine.
@@ -99,6 +105,19 @@ public:
     void set_max_incoming_connections(std::size_t count);
     void set_incoming_password(ByteView password);
     void set_offline_ping_response(ByteView data);
+
+    /// Sets the time-out of one connection, overriding Config::timeout (RakNet's SetTimeoutTime for
+    /// one system). Errc::unknown_connection for an unknown id, Errc::invalid_argument unless positive.
+    void set_timeout(transport::ConnectionId connection, std::chrono::milliseconds timeout, std::error_code& ec);
+    void set_timeout(transport::ConnectionId connection, std::chrono::milliseconds timeout)
+    {
+        std::error_code ec;
+        set_timeout(connection, timeout, ec);
+        detail::throw_if(ec, "RakNetEngine::set_timeout");
+    }
+    /// Sets the time-out for new connections and for every existing one, replacing per-connection
+    /// values (RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS). Non-positive values are ignored.
+    void set_timeout(std::chrono::milliseconds timeout);
 
     /// Sends an unconnected ping; a reply arrives as an Unconnected event holding an UnconnectedPong.
     /// With `only_if_accepting`, peers that have no free incoming slot stay silent.
