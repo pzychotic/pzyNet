@@ -181,6 +181,29 @@ public:
         return send(to, message.data(), options);
     }
 
+    /// Bans an IPv4 address as RakNet's AddToBanList does: every datagram from it is dropped and
+    /// answered with id::connection_banned, so its connection attempts fail with that id and existing
+    /// connections time out. `address` is dotted; a '*' matches the rest ("192.168.*"). A zero
+    /// `duration` bans permanently. Errors: Errc::not_open, Errc::invalid_argument (empty or longer
+    /// than 15 characters). The ban list lives as long as the running Peer.
+    void ban(std::string_view address, std::chrono::milliseconds duration, std::error_code& ec);
+    void ban(std::string_view address, std::chrono::milliseconds duration = std::chrono::milliseconds(0))
+    {
+        std::error_code ec;
+        ban(address, duration, ec);
+        detail::throw_if(ec, "Peer::ban");
+    }
+    /// Removes exactly this entry from the ban list.
+    void unban(std::string_view address);
+    void clear_bans();
+    /// True if `address` (dotted) is banned. False while not running.
+    bool is_banned(std::string_view address) const;
+
+    /// RakNet's SetLimitIPConnectionFrequency: refuse, with id::ip_recently_connected, a connection
+    /// attempt from an IP that set up a connection less than 100 ms before. Also settable through
+    /// PeerConfig::engine. Ignored while not running.
+    void set_limit_ip_connection_frequency(bool limit);
+
     /// Diagnostics of the connection to `remote`; Errc::not_connected if there is none.
     ConnectionStats statistics(const Remote& remote, std::error_code& ec) const;
     ConnectionStats statistics(const Remote& remote) const

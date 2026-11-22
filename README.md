@@ -208,6 +208,10 @@ for (;;) {
   `set_incoming_password()` change those settings while running.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+- `ban(address, duration)` refuses an IPv4 address (`"192.168.*"` wildcards allowed; zero duration
+  bans permanently) with `id::connection_banned`; `unban()`, `clear_bans()` and `is_banned()` complete
+  RakNet's ban list. `set_limit_ip_connection_frequency(true)` (or `PeerConfig::engine`) refuses an IP
+  that connected less than 100 ms before with `id::ip_recently_connected`.
 - `statistics(remote)` returns a `raknet::ConnectionStats` for a connected remote: bytes and messages
   sent and received, resent datagrams, datagrams presumed lost, and the send queue in messages and bytes
   (the engine offers the same through `RakNetEngine::connection_stats()`). It is a small diagnostic
