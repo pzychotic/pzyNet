@@ -4,6 +4,7 @@
 #include "pzynet/raknet/bit_stream.hpp"
 #include "pzynet/raknet/message_ids.hpp"
 #include "pzynet/rakpeer/peer.hpp"
+#include "pzynet/socket/udp_socket.hpp"
 
 #include "BitStream.h"
 #include "GetTime.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -60,12 +62,18 @@ struct Fixture
 
     RakNet::SystemAddress peer_address; // the Peer as the RakPeer sees it
 
-    explicit Fixture(ClockSource peer_clock = ClockSource())
+    static rn::PeerConfig peer_config(ClockSource peer_clock = ClockSource())
     {
         rn::PeerConfig config;
         config.bind = Endpoint(IpAddress::loopback_v4(), 0);
         config.engine.max_incoming_connections = 4;
         config.clock = std::move(peer_clock);
+        return config;
+    }
+
+    explicit Fixture(ClockSource peer_clock = ClockSource()) : Fixture(peer_config(std::move(peer_clock))) {}
+    explicit Fixture(rn::PeerConfig config)
+    {
         peer.start(config);
 
         RakNet::SocketDescriptor descriptor(0, "127.0.0.1");
@@ -372,4 +380,211 @@ TEST_CASE("Peer: after shutdown the RakPeer gets no notification and the port is
     std::error_code ec;
     again.start(config, ec);
     CHECK_FALSE(ec);
+}
+
+namespace
+{
+
+/// A second RakPeer acting as a client: the reference for what a connect attempt should report.
+struct RakClient
+{
+    RakNet::RakPeerInterface* rak = RakNet::RakPeerInterface::GetInstance();
+
+    RakClient()
+    {
+        RakNet::SocketDescriptor descriptor(0, "127.0.0.1");
+        REQUIRE(rak->Startup(1, &descriptor, 1) == RakNet::RAKNET_STARTED);
+    }
+    ~RakClient()
+    {
+        rak->Shutdown(0);
+        RakNet::RakPeerInterface::DestroyInstance(rak);
+    }
+
+    /// Connects and returns the id of the first Packet that arrives, or 0 if none does.
+    unsigned char connect(std::uint16_t port, const char* password = nullptr, unsigned attempts = 12,
+                          unsigned interval_ms = 500)
+    {
+        const int length = password ? static_cast<int>(std::strlen(password)) : 0;
+        REQUIRE(rak->Connect("127.0.0.1", port, password, length, 0u, attempts, interval_ms) ==
+                RakNet::CONNECTION_ATTEMPT_STARTED);
+        const auto give_up = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < give_up)
+        {
+            if (RakNet::Packet* packet = rak->Receive())
+            {
+                const unsigned char id = packet->data[0];
+                rak->DeallocatePacket(packet);
+                return id;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        return 0;
+    }
+};
+
+Bytes bytes(const char* text)
+{
+    return Bytes(text, text + std::strlen(text));
+}
+
+/// Connects the fixture's Peer to `to` and returns the id of its first Packet, or 0 if none arrives.
+unsigned char peer_connect(Fixture& f, const Endpoint& to, const Bytes& password = Bytes())
+{
+    f.peer_packets.clear();
+    f.peer.connect(to, password);
+    if (!f.wait_until([&] { return !f.peer_packets.empty(); }, 15s))
+        return 0;
+    return f.peer_packets.front().id;
+}
+
+} // namespace
+
+TEST_CASE("Peer: a RakPeer's refusals arrive as the ids a RakPeer client gets", "[interop][rakpeer]")
+{
+    Fixture f;
+    unsigned char expected = 0;
+    Bytes password;
+    const char* rak_password = nullptr;
+    SECTION("no free incoming connections")
+    {
+        f.rak->SetMaximumIncomingConnections(0);
+        expected = ID_NO_FREE_INCOMING_CONNECTIONS;
+    }
+    SECTION("banned")
+    {
+        f.rak->AddToBanList("127.0.0.1");
+        expected = ID_CONNECTION_BANNED;
+    }
+    SECTION("wrong password")
+    {
+        f.rak->SetIncomingPassword("secret", 6);
+        password = bytes("nope");
+        rak_password = "nope";
+        expected = ID_INVALID_PASSWORD;
+    }
+
+    RakClient reference;
+    CHECK(reference.connect(f.rak_endpoint().port(), rak_password) == expected);
+    REQUIRE(peer_connect(f, f.rak_endpoint(), password) == expected);
+    CHECK(f.peer_packets.front().address == f.rak_endpoint());
+}
+
+TEST_CASE("Peer: an unanswered attempt fails as it does for a RakPeer client", "[interop][rakpeer]")
+{
+    UdpSocket silent;
+    silent.open(IpAddress::Family::v4);
+    silent.bind(Endpoint(IpAddress::loopback_v4(), 0));
+    const std::uint16_t port = silent.local_endpoint().port();
+
+    rn::PeerConfig config = Fixture::peer_config();
+    config.engine.connect_attempts = 3;
+    config.engine.connect_attempt_interval = 100ms;
+    Fixture f(config);
+
+    RakClient reference;
+    CHECK(reference.connect(port, nullptr, 3, 100) == ID_CONNECTION_ATTEMPT_FAILED);
+    CHECK(peer_connect(f, Endpoint(IpAddress::loopback_v4(), port)) == ID_CONNECTION_ATTEMPT_FAILED);
+}
+
+TEST_CASE("Peer: connecting with a GUID the RakPeer already has connected is refused", "[interop][rakpeer]")
+{
+    Fixture f;
+    RakClient first;
+    REQUIRE(first.connect(f.rak_endpoint().port()) == ID_CONNECTION_REQUEST_ACCEPTED);
+
+    rn::PeerConfig config = Fixture::peer_config();
+    config.engine.guid = first.rak->GetMyGUID().g;
+    rn::Peer twin;
+    twin.start(config);
+    twin.connect(f.rak_endpoint());
+    std::optional<rn::Packet> packet;
+    const auto give_up = std::chrono::steady_clock::now() + 15s;
+    while (!packet && std::chrono::steady_clock::now() < give_up)
+    {
+        packet = twin.receive();
+        std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(packet);
+    CHECK(packet->id == ID_ALREADY_CONNECTED);
+}
+
+TEST_CASE("Peer: refuses a RakPeer client with the ids a RakPeer would use", "[interop][rakpeer]")
+{
+    rn::PeerConfig config = Fixture::peer_config();
+    unsigned char expected = 0;
+    const char* password = nullptr;
+    SECTION("no free incoming connections")
+    {
+        config.engine.max_incoming_connections = 0;
+        expected = ID_NO_FREE_INCOMING_CONNECTIONS;
+    }
+    SECTION("wrong password")
+    {
+        config.engine.incoming_password = bytes("secret");
+        password = "nope";
+        expected = ID_INVALID_PASSWORD;
+    }
+    Fixture f(config);
+
+    RakClient client;
+    CHECK(client.connect(f.peer.local_endpoint().port(), password) == expected);
+    f.wait_until([] { return false; }, 300ms);
+    CHECK(f.peer_packets.empty());
+}
+
+TEST_CASE("Peer: the right password connects to and from a RakPeer", "[interop][rakpeer]")
+{
+    SECTION("Peer connects to RakPeer")
+    {
+        Fixture f;
+        f.rak->SetIncomingPassword("secret", 6);
+        CHECK(peer_connect(f, f.rak_endpoint(), bytes("secret")) == ID_CONNECTION_REQUEST_ACCEPTED);
+        REQUIRE(f.wait_until([&] { return f.rak_count(ID_NEW_INCOMING_CONNECTION) == 1; }));
+    }
+    SECTION("RakPeer connects to Peer")
+    {
+        rn::PeerConfig config = Fixture::peer_config();
+        config.engine.incoming_password = bytes("secret");
+        Fixture f(config);
+        RakClient client;
+        CHECK(client.connect(f.peer.local_endpoint().port(), "secret") == ID_CONNECTION_REQUEST_ACCEPTED);
+        REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::new_incoming_connection) == 1; }));
+    }
+}
+
+TEST_CASE("Peer: a vanished remote is a lost connection on either side, not a disconnection",
+          "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    rn::PeerConfig config = Fixture::peer_config();
+    config.engine.timeout = 1s;
+    Fixture f(config);
+    f.rak->SetTimeoutTime(1000, RakNet::UNASSIGNED_SYSTEM_ADDRESS);
+    f.establish(direction);
+
+    SECTION("the RakPeer goes silent")
+    {
+        f.rak->Shutdown(0);
+        REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::connection_lost) == 1; }));
+        CHECK(f.peer_count(rn::id::disconnection_notification) == 0);
+        CHECK(f.peer_last(rn::id::connection_lost).guid == f.rak_guid());
+    }
+    SECTION("the Peer goes silent")
+    {
+        f.peer.shutdown();
+        REQUIRE(f.wait_until([&] { return f.rak_count(ID_CONNECTION_LOST) == 1; }));
+        CHECK(f.rak_count(ID_DISCONNECTION_NOTIFICATION) == 0);
+    }
+}
+
+TEST_CASE("Peer: connects to a RakPeer by host name", "[interop][rakpeer]")
+{
+    Fixture f;
+    f.peer.connect("localhost", f.rak_endpoint().port());
+    REQUIRE(f.wait_until([&] {
+        return f.peer_count(rn::id::connection_request_accepted) == 1 && f.rak_count(ID_NEW_INCOMING_CONNECTION) == 1;
+    }));
+    CHECK(f.peer_last(rn::id::connection_request_accepted).address == f.rak_endpoint());
 }
