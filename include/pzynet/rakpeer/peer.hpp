@@ -62,6 +62,12 @@ struct SendOptions
 /// id::disconnection_notification, a time-out id::connection_lost. Connections this Peer closes itself
 /// produce no Packet.
 ///
+/// Timestamped messages (id::timestamp, an 8-byte time, then the real message id) are converted as
+/// RakPeer does: on receipt the time is shifted from the sender's clock into this Peer's clock by the
+/// connection's measured clock offset, rewritten in place in the Packet's data (in PeerConfig::byte_order)
+/// and exposed as Packet::timestamp. A message whose header is shorter than 9 bytes is delivered
+/// unmodified, without a timestamp. Outgoing messages are never altered.
+///
 /// All calls except start() and shutdown() may be made from any thread.
 class Peer
 {
@@ -91,6 +97,11 @@ public:
     Guid guid() const;
     /// The bound local address. Only meaningful while running.
     Endpoint local_endpoint() const;
+
+    /// The current time on this Peer's clock (PeerConfig::clock) in RakNet time: milliseconds, as
+    /// RakNet's GetTime() returns. Write it after id::timestamp to send a timestamped message; Packet
+    /// timestamps are expressed in it. While not running, the steady clock's time.
+    std::uint64_t time() const;
 
     /// Starts connecting. The outcome arrives as a Packet: id::connection_request_accepted, or one of
     /// RakNet's connect-failure ids.
@@ -148,6 +159,16 @@ public:
     /// attempt from an IP that set up a connection less than 100 ms before. Also settable through
     /// PeerConfig::engine. Ignored while not running.
     void set_limit_ip_connection_frequency(bool limit);
+
+    /// Diagnostics of the connection to `remote`; Errc::not_connected if there is none.
+    ConnectionStats statistics(const Remote& remote, std::error_code& ec) const;
+    ConnectionStats statistics(const Remote& remote) const
+    {
+        std::error_code ec;
+        ConnectionStats stats = statistics(remote, ec);
+        detail::throw_if(ec, "Peer::statistics");
+        return stats;
+    }
 
     /// The next Packet, if any. Never blocks.
     std::optional<Packet> receive();

@@ -6,6 +6,7 @@
 #include "pzynet/rakpeer/peer.hpp"
 
 #include "BitStream.h"
+#include "GetTime.h"
 #include "MessageIdentifiers.h"
 #include "PacketPriority.h"
 #include "RakNetTypes.h"
@@ -60,11 +61,12 @@ struct Fixture
 
     RakNet::SystemAddress peer_address; // the Peer as the RakPeer sees it
 
-    Fixture()
+    explicit Fixture(ClockSource peer_clock = ClockSource())
     {
         rn::PeerConfig config;
         config.bind = Endpoint(IpAddress::loopback_v4(), 0);
         config.engine.max_incoming_connections = 4;
+        config.clock = std::move(peer_clock);
         peer.start(config);
 
         RakNet::SocketDescriptor descriptor(0, "127.0.0.1");
@@ -272,6 +274,59 @@ TEST_CASE("BitStream: the writer's bytes equal RakNet's for the same booleans an
     CHECK(ours.bit_count() == theirs.GetNumberOfBitsUsed());
     CHECK(Bytes(ours.data().begin(), ours.data().end()) ==
           Bytes(theirs.GetData(), theirs.GetData() + theirs.GetNumberOfBytesUsed()));
+}
+
+TEST_CASE("Peer: timestamped messages exchanged with a RakPeer arrive in local time on both sides",
+          "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    // The Peer's clock runs an hour ahead of the RakPeer's, so an unconverted time would be an hour off.
+    Fixture f([] { return Clock::now() + 1h; });
+    f.establish(direction);
+    const auto difference = [](std::uint64_t a, std::uint64_t b) { return static_cast<std::int64_t>(a - b); };
+    REQUIRE(difference(f.peer.time(), RakNet::GetTime()) > 3'500'000);
+
+    // pzyNet -> RakNet: RakPeer's Receive shifts the time into its own clock.
+    rn::BitStreamWriter out;
+    out.write(rn::id::timestamp);
+    out.write(f.peer.time());
+    out.write(static_cast<std::uint8_t>(ID_USER_PACKET_ENUM));
+    out.write(std::uint16_t{0xBEEF});
+    f.peer.send(f.rak_guid(), out);
+    REQUIRE(f.wait_until([&] { return f.rak_count(ID_TIMESTAMP) == 1; }));
+    const RakNet::Time rak_received_at = RakNet::GetTime();
+    Bytes received = f.rak_last(ID_TIMESTAMP).data;
+    RakNet::BitStream in(received.data(), static_cast<unsigned int>(received.size()), false);
+    in.IgnoreBytes(1);
+    RakNet::Time rak_time = 0;
+    unsigned char real_id = 0;
+    std::uint16_t value = 0;
+    CHECK(in.Read(rak_time));
+    CHECK(in.Read(real_id));
+    CHECK(in.Read(value));
+    CHECK(difference(rak_received_at, rak_time) >= -20);
+    CHECK(difference(rak_received_at, rak_time) <= 100);
+    CHECK(real_id == ID_USER_PACKET_ENUM);
+    CHECK(value == 0xBEEF);
+
+    // RakNet -> pzyNet
+    RakNet::BitStream reply;
+    reply.Write(static_cast<unsigned char>(ID_TIMESTAMP));
+    reply.Write(RakNet::GetTime());
+    reply.Write(static_cast<unsigned char>(ID_USER_PACKET_ENUM + 2));
+    reply.Write(std::uint32_t{0xCAFEF00D});
+    REQUIRE(f.rak->Send(&reply, HIGH_PRIORITY, RELIABLE_ORDERED, 0, f.peer_address, false) != 0);
+    REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::timestamp) == 1; }));
+    const std::uint64_t peer_received_at = f.peer.time();
+    const rn::Packet& packet = f.peer_last(rn::id::timestamp);
+    REQUIRE(packet.timestamp);
+    CHECK(difference(peer_received_at, *packet.timestamp) >= -20);
+    CHECK(difference(peer_received_at, *packet.timestamp) <= 100);
+    rn::BitStreamReader reader = packet.reader();
+    CHECK(reader.read<std::uint8_t>() == ID_USER_PACKET_ENUM + 2);
+    CHECK(reader.read<std::uint32_t>() == 0xCAFEF00D);
+    CHECK(reader.ok());
 }
 
 TEST_CASE("Peer: a RakPeer's close arrives as a disconnection notification", "[interop][rakpeer]")

@@ -9,6 +9,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -103,6 +104,7 @@ TEST_CASE("Peer: a BitStream message arrives as a Packet whose reader starts aft
     CHECK(packet->guid == pair.client.guid());
     CHECK(packet->address == pair.client.local_endpoint());
     CHECK(packet->data == std::vector<std::uint8_t>(message.data().begin(), message.data().end()));
+    CHECK_FALSE(packet->timestamp);
 
     BitStreamReader reader = packet->reader();
     CHECK(reader.read<bool>() == true);
@@ -129,6 +131,34 @@ TEST_CASE("Peer: a remote close arrives as a disconnection notification; a local
     std::error_code ec;
     pair.client.send(pair.server.guid(), std::vector<std::uint8_t>{id::user_packet_enum}, SendOptions(), ec);
     CHECK(ec == Errc::not_connected);
+}
+
+TEST_CASE("Peer: statistics are reported for a connected remote and refused for an unknown one", "[rakpeer]")
+{
+    Pair pair;
+    const std::vector<std::uint8_t> message{id::user_packet_enum, 1, 2, 3};
+    pair.client.send(pair.server.guid(), message);
+    pair.client.send(pair.server.local_endpoint(), message);
+    REQUIRE(wait_for_packet(pair.server));
+    REQUIRE(wait_for_packet(pair.server));
+
+    const ConnectionStats by_guid = pair.client.statistics(pair.server.guid());
+    CHECK(by_guid.messages_sent == 2);
+    CHECK(by_guid.bytes_sent > 0);
+    CHECK(by_guid.bytes_received > 0);
+    const ConnectionStats at_server = pair.server.statistics(pair.client.local_endpoint());
+    CHECK(at_server.messages_received == 2);
+
+    std::error_code ec;
+    pair.client.statistics(Guid{0x1234}, ec);
+    CHECK(ec == Errc::not_connected);
+    pair.client.statistics(Endpoint(IpAddress::loopback_v4(), 1), ec);
+    CHECK(ec == Errc::not_connected);
+    CHECK_THROWS_AS(pair.client.statistics(Guid{0x1234}), std::system_error);
+
+    Peer stopped;
+    stopped.statistics(Guid{0x1234}, ec);
+    CHECK(ec == Errc::not_open);
 }
 
 TEST_CASE("Peer: shutdown, and destruction, stop the network and release the socket", "[rakpeer]")
@@ -235,4 +265,98 @@ TEST_CASE("Peer: a client reconnecting too quickly gets an IP-recently-connected
     const std::optional<Packet> refused = wait_for_packet(second);
     REQUIRE(refused);
     CHECK(refused->id == id::ip_recently_connected);
+}
+
+namespace
+{
+
+/// Signed difference of two RakNet times (which wrap around like RakNet's unsigned arithmetic).
+std::int64_t time_difference(std::uint64_t a, std::uint64_t b)
+{
+    return static_cast<std::int64_t>(a - b);
+}
+
+/// The big-endian 8-byte time in a timestamped message's header.
+std::uint64_t header_time(const std::vector<std::uint8_t>& data)
+{
+    std::uint64_t value = 0;
+    for (std::size_t i = 1; i < 9; ++i)
+        value = (value << 8) | data[i];
+    return value;
+}
+
+} // namespace
+
+TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clock", "[rakpeer]")
+{
+    // One side's clock runs an hour ahead, so an unconverted time would be an hour off.
+    const bool skew_sender = GENERATE(true, false);
+    INFO((skew_sender ? "sender's clock is ahead" : "receiver's clock is ahead"));
+    const ClockSource ahead = [] { return Clock::now() + 1h; };
+
+    PeerConfig server_config = loopback_config(4);
+    PeerConfig client_config = loopback_config();
+    (skew_sender ? client_config : server_config).clock = ahead;
+    Peer server;
+    server.start(server_config);
+    Peer client;
+    client.start(client_config);
+    client.connect(server.local_endpoint());
+    REQUIRE(wait_for_packet(client));
+    REQUIRE(wait_for_packet(server));
+
+    const std::int64_t skew = time_difference(client.time(), server.time());
+    CHECK(std::abs(skew - (skew_sender ? 3'600'000 : -3'600'000)) <= 50);
+
+    const std::uint64_t sent_at = client.time();
+    BitStreamWriter message;
+    message.write(id::timestamp);
+    message.write(sent_at);
+    message.write(id::user_packet_enum);
+    message.write(std::uint32_t{0xC0FFEE});
+    client.send(server.guid(), message);
+
+    const std::optional<Packet> packet = wait_for_packet(server);
+    REQUIRE(packet);
+    const std::uint64_t received_at = server.time();
+    REQUIRE(packet->timestamp);
+    // Sent moments ago in the receiver's clock: within the clock offset's error of loopback round trips.
+    CHECK(time_difference(received_at, *packet->timestamp) >= -20);
+    CHECK(time_difference(received_at, *packet->timestamp) <= 100);
+
+    CHECK(packet->id == id::timestamp);
+    CHECK(packet->guid == client.guid());
+    REQUIRE(packet->data.size() == 14);
+    CHECK(header_time(packet->data) == *packet->timestamp);
+    CHECK(std::vector<std::uint8_t>(packet->data.begin() + 9, packet->data.end()) ==
+          std::vector<std::uint8_t>{id::user_packet_enum, 0x00, 0xC0, 0xFF, 0xEE});
+
+    BitStreamReader reader = packet->reader();
+    CHECK(reader.read<std::uint8_t>() == id::user_packet_enum);
+    CHECK(reader.read<std::uint32_t>() == 0xC0FFEE);
+    CHECK(reader.ok());
+}
+
+TEST_CASE("Peer: a timestamped message with a truncated header is delivered unmodified", "[rakpeer]")
+{
+    PeerConfig client_config = loopback_config();
+    client_config.clock = [] { return Clock::now() + 1h; }; // any conversion would change the bytes
+    Peer server;
+    server.start(loopback_config(4));
+    Peer client;
+    client.start(client_config);
+    client.connect(server.local_endpoint());
+    REQUIRE(wait_for_packet(client));
+    REQUIRE(wait_for_packet(server));
+
+    const std::vector<std::uint8_t> truncated{id::timestamp, 1, 2, 3, 4, 5, 6, 7};
+    client.send(server.guid(), truncated);
+
+    const std::optional<Packet> packet = wait_for_packet(server);
+    REQUIRE(packet);
+    CHECK(packet->id == id::timestamp);
+    CHECK(packet->data == truncated);
+    CHECK_FALSE(packet->timestamp);
+    BitStreamReader reader = packet->reader();
+    CHECK(reader.read<std::uint8_t>() == 1);
 }

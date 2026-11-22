@@ -64,6 +64,10 @@ struct Connection
     std::vector<transport::Message> early;
 
     std::optional<std::chrono::milliseconds> clock_offset;
+
+    // application messages, for ConnectionStats
+    std::uint64_t messages_sent = 0;
+    std::uint64_t messages_received = 0;
 };
 
 std::uint64_t random_guid()
@@ -288,7 +292,10 @@ struct RakNetEngine::Impl
         connection.announced = true;
         events.push_back(transport::Connected{connection.id, connection.remote, connection.incoming});
         for (transport::Message& message : connection.early)
+        {
+            ++connection.messages_received;
             events.push_back(std::move(message));
+        }
         connection.early.clear();
     }
 
@@ -611,6 +618,7 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
         case id::invalid_password:
             return; // stale handshake traffic
         default:
+            ++connection.messages_received;
             events.push_back(
                 transport::Message{connection.id, message.reliability, message.channel, std::move(message.data)});
             return;
@@ -909,7 +917,11 @@ void RakNetEngine::send(ConnectionId id, ByteView data, const transport::SendOpt
                                             options.reliability == Reliability::reliable_sequenced))
         ec = make_error_code(Errc::invalid_argument); // RakNet has no sequenced + receipt combination
     else
+    {
         ec = connection->session->send(data, options, impl.now);
+        if (!ec)
+            ++connection->messages_sent;
+    }
 }
 
 std::uint64_t RakNetEngine::guid() const noexcept
@@ -936,6 +948,27 @@ std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) con
     if (connection->session)
         info.rtt = connection->session->rtt();
     return info;
+}
+
+std::optional<ConnectionStats> RakNetEngine::connection_stats(ConnectionId id) const
+{
+    const Connection* connection = impl_->find(id);
+    if (connection == nullptr)
+        return std::nullopt;
+    ConnectionStats stats;
+    stats.messages_sent = connection->messages_sent;
+    stats.messages_received = connection->messages_received;
+    if (const Session* session = connection->session.get())
+    {
+        const detail::SessionCounters& counters = session->counters();
+        stats.bytes_sent = counters.bytes_sent;
+        stats.bytes_received = counters.bytes_received;
+        stats.datagrams_resent = counters.datagrams_resent;
+        stats.datagrams_lost = counters.datagrams_lost;
+        stats.queued_messages = session->queued_messages();
+        stats.queued_bytes = session->queued_bytes();
+    }
+    return stats;
 }
 
 void RakNetEngine::set_max_incoming_connections(std::size_t count)

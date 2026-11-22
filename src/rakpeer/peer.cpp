@@ -3,6 +3,7 @@
 #include "pzynet/raknet/message_ids.hpp"
 #include "pzynet/transport/udp_host.hpp"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 
@@ -54,7 +55,7 @@ struct Peer::Impl
     std::uint32_t next_receipt = 1;
 
     /// The time as the engine sees it.
-    TimePoint now() const { return config.clock ? config.clock() : Clock::now(); }
+    TimePoint clock_now() const { return config.clock ? config.clock() : Clock::now(); }
 
     /// Requires `mutex`.
     transport::ConnectionId find(const Remote& remote) const
@@ -79,6 +80,27 @@ struct Peer::Impl
         packet.data = {message_id};
         packet.byte_order = config.byte_order;
         return packet;
+    }
+
+    std::uint64_t now() const { return RakNetEngine::wire_time(clock_now()); }
+
+    /// Shifts a timestamped message's time from the sender's clock into ours, in place, as RakPeer's
+    /// ShiftIncomingTimestamp does (unsigned wrap-around; no measured offset means no shift).
+    void to_local_time(Packet& packet, transport::ConnectionId connection)
+    {
+        const std::optional<ConnectionInfo> info =
+            host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+        const std::uint64_t offset =
+            info && info->clock_offset ? static_cast<std::uint64_t>(info->clock_offset->count()) : 0;
+
+        const ByteView header = ByteView(packet.data.data(), packet.data.size()).subspan(1, 8);
+        BitStreamReader reader(header, config.byte_order);
+        const std::uint64_t local = reader.read<std::uint64_t>() - offset;
+
+        BitStreamWriter writer(config.byte_order);
+        writer.write(local);
+        std::copy(writer.data().begin(), writer.data().end(), packet.data.begin() + 1);
+        packet.timestamp = local;
     }
 
     /// Turns a transport event into a Packet; nullopt for events RakNet does not report.
@@ -124,6 +146,8 @@ struct Peer::Impl
             }
             Packet packet = make_packet(message->data[0], remote);
             packet.data = std::move(message->data);
+            if (packet.id == id::timestamp && packet.data.size() >= Packet::timestamp_header_size)
+                to_local_time(packet, message->connection);
             return packet;
         }
         return std::nullopt; // receipts and offline datagrams are not reported yet
@@ -170,6 +194,11 @@ Guid Peer::guid() const
 Endpoint Peer::local_endpoint() const
 {
     return impl_ ? impl_->host.local_endpoint() : Endpoint();
+}
+
+std::uint64_t Peer::time() const
+{
+    return impl_ ? impl_->now() : RakNetEngine::wire_time(Clock::now());
 }
 
 void Peer::connect(const Endpoint& to, ByteView password, std::error_code& ec)
@@ -239,7 +268,7 @@ void Peer::ban(std::string_view address, std::chrono::milliseconds duration, std
         return;
     }
     const bool added = impl_->host.with_engine(
-        [&](transport::Engine&) { return impl_->engine.ban(address, duration, impl_->now()); });
+        [&](transport::Engine&) { return impl_->engine.ban(address, duration, impl_->clock_now()); });
     if (!added)
         ec = make_error_code(Errc::invalid_argument);
 }
@@ -261,13 +290,38 @@ bool Peer::is_banned(std::string_view address) const
     if (!impl_)
         return false;
     return impl_->host.with_engine(
-        [&](transport::Engine&) { return impl_->engine.is_banned(address, impl_->now()); });
+        [&](transport::Engine&) { return impl_->engine.is_banned(address, impl_->clock_now()); });
 }
 
 void Peer::set_limit_ip_connection_frequency(bool limit)
 {
     if (impl_)
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_limit_ip_connection_frequency(limit); });
+}
+
+ConnectionStats Peer::statistics(const Remote& remote, std::error_code& ec) const
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return ConnectionStats();
+    }
+    transport::ConnectionId connection = transport::invalid_connection;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        connection = impl_->find(remote);
+    }
+    const std::optional<ConnectionStats> stats =
+        connection == transport::invalid_connection
+            ? std::nullopt
+            : impl_->host.with_engine([&](transport::Engine&) { return impl_->engine.connection_stats(connection); });
+    if (!stats)
+    {
+        ec = make_error_code(Errc::not_connected);
+        return ConnectionStats();
+    }
+    return *stats;
 }
 
 std::optional<Packet> Peer::receive()

@@ -71,6 +71,8 @@ public:
 
     /// Sees every datagram put on the wire, before the link properties apply.
     std::function<void(const Datagram&)> tap;
+    /// Loses the datagrams it returns true for (after tap, before the link properties apply).
+    std::function<bool(const Datagram&)> drop;
 
     pzynet::TimePoint now = pzynet::TimePoint() + std::chrono::hours(1);
     std::size_t datagrams_sent = 0;
@@ -115,6 +117,8 @@ public:
                 ++datagrams_sent;
                 if (tap)
                     tap(datagram);
+                if (drop && drop(datagram))
+                    continue;
                 if (datagram.data.size() + 28 > path_mtu)
                     continue; // too big for the path (RakNet's probes never rely on fragmentation)
                 if (chance(loss))

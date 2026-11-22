@@ -63,6 +63,27 @@ struct ConnectionInfo
     std::optional<std::chrono::milliseconds> clock_offset;
 };
 
+/// Basic diagnostics of one connection, counted since its handshake reached the reliability layer.
+struct ConnectionStats
+{
+    /// UDP payload bytes of the connection's datagrams (data, acknowledgements, retransmissions).
+    std::uint64_t bytes_sent = 0;
+    std::uint64_t bytes_received = 0;
+    /// Application messages: accepted by send(), and delivered as Message events. The engine's own
+    /// messages (handshake, pings, disconnection notice) are not counted.
+    std::uint64_t messages_sent = 0;
+    std::uint64_t messages_received = 0;
+    /// Datagrams sent that carried at least one retransmitted message.
+    std::uint64_t datagrams_resent = 0;
+    /// Data datagrams the remote system reported missing (NAK) or that went unacknowledged until a
+    /// retransmission time-out; each is counted once, even if it turns up later.
+    std::uint64_t datagrams_lost = 0;
+    /// Messages waiting in the send queue, and their payload bytes. A split message counts once until
+    /// its last piece leaves; the engine's own queued messages are included.
+    std::size_t queued_messages = 0;
+    std::size_t queued_bytes = 0;
+};
+
 /// The RakNet 4.x wire protocol (protocol version 6) as a transport::Engine.
 ///
 /// Wire-compatible with stock RakNet peers built without security and without IPv6 support.
@@ -100,6 +121,8 @@ public:
     std::uint64_t guid() const noexcept;
     std::size_t connection_count() const noexcept;
     std::optional<ConnectionInfo> connection_info(transport::ConnectionId connection) const;
+    /// nullopt for a connection the application cannot see (unknown, closed or failed).
+    std::optional<ConnectionStats> connection_stats(transport::ConnectionId connection) const;
 
     void set_max_incoming_connections(std::size_t count);
     void set_incoming_password(ByteView password);
