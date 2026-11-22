@@ -10,11 +10,13 @@
 #include "pzynet/transport/types.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <system_error>
 #include <variant>
+#include <vector>
 
 namespace pzynet
 {
@@ -50,6 +52,18 @@ struct SendOptions
     /// Ordering channel, 0..31.
     std::uint8_t channel = 0;
     transport::Priority priority = transport::Priority::medium;
+};
+
+/// One connected system, as Peer::connections() lists it.
+struct RemoteSystem
+{
+    Guid guid;
+    Endpoint address;
+    /// Smoothed round-trip time; nullopt until the first acknowledgement arrived.
+    std::optional<Duration> rtt;
+    std::uint16_t mtu = 0;
+    /// true if the remote system initiated the connection.
+    bool incoming = false;
 };
 
 /// A RakNet-style endpoint: owns a UDP socket and a RakNet engine and offers RakNet's application-level
@@ -102,8 +116,14 @@ public:
     }
 
     /// Closes a connection; with DisconnectMode::graceful, the remote system is notified once pending
-    /// reliable data is delivered. Produces no Packet. Unknown remotes are ignored.
-    void disconnect(const Remote& remote, transport::DisconnectMode mode = transport::DisconnectMode::graceful);
+    /// reliable data is delivered. Produces no Packet. An unknown remote yields Errc::not_connected.
+    void disconnect(const Remote& remote, transport::DisconnectMode mode, std::error_code& ec);
+    /// As above, but unknown remotes are ignored.
+    void disconnect(const Remote& remote, transport::DisconnectMode mode = transport::DisconnectMode::graceful)
+    {
+        std::error_code ec;
+        disconnect(remote, mode, ec);
+    }
 
     /// Sends a message, which must start with its message id. Returns the send's receipt number,
     /// which is never 0.
@@ -123,6 +143,61 @@ public:
     std::uint32_t send(const Remote& to, const BitStreamWriter& message, const SendOptions& options = SendOptions())
     {
         return send(to, message.data(), options);
+    }
+
+    /// The connected systems: those whose connection Packet was produced and that have not
+    /// disconnected since. Empty if not running.
+    std::vector<RemoteSystem> connections() const;
+    /// The GUID of the system connected from `address`, if any.
+    std::optional<Guid> guid_of(const Endpoint& address) const;
+    /// The address of the connected system `guid`, if any.
+    std::optional<Endpoint> address_of(const Guid& guid) const;
+
+    /// Sends an offline ping (ID_UNCONNECTED_PING); no connection is needed. A reply arrives as a
+    /// Packet id::unconnected_pong: `[id][u32 ping send time in RakNet time][the responder's offline
+    /// ping response]`. With `only_if_accepting` (ID_UNCONNECTED_PING_OPEN_CONNECTIONS), systems without
+    /// a free incoming slot stay silent.
+    void ping(const Endpoint& to, bool only_if_accepting, std::error_code& ec);
+    void ping(const Endpoint& to, bool only_if_accepting = false)
+    {
+        std::error_code ec;
+        ping(to, only_if_accepting, ec);
+        detail::throw_if(ec, "Peer::ping");
+    }
+
+    /// Sends ID_ADVERTISE_SYSTEM with `data` (at most 399 bytes) to a system without connecting. It
+    /// arrives as a Packet id::advertise_system: `[id][data]`.
+    void advertise(const Endpoint& to, ByteView data, std::error_code& ec);
+    void advertise(const Endpoint& to, ByteView data = ByteView())
+    {
+        std::error_code ec;
+        advertise(to, data, ec);
+        detail::throw_if(ec, "Peer::advertise");
+    }
+
+    /// The payload returned to offline pings (at most 399 bytes; empty for none).
+    void set_offline_ping_response(ByteView data, std::error_code& ec);
+    void set_offline_ping_response(ByteView data)
+    {
+        std::error_code ec;
+        set_offline_ping_response(data, ec);
+        detail::throw_if(ec, "Peer::set_offline_ping_response");
+    }
+    /// How many systems may connect to this Peer. Existing connections are kept when lowering it.
+    void set_max_incoming_connections(std::size_t count, std::error_code& ec);
+    void set_max_incoming_connections(std::size_t count)
+    {
+        std::error_code ec;
+        set_max_incoming_connections(count, ec);
+        detail::throw_if(ec, "Peer::set_max_incoming_connections");
+    }
+    /// The password connecting systems must present (at most 255 bytes); empty for none.
+    void set_incoming_password(ByteView password, std::error_code& ec);
+    void set_incoming_password(ByteView password)
+    {
+        std::error_code ec;
+        set_incoming_password(password, ec);
+        detail::throw_if(ec, "Peer::set_incoming_password");
     }
 
     /// The next Packet, if any. Never blocks.
