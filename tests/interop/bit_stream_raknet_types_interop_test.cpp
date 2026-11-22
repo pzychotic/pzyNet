@@ -37,6 +37,31 @@ TEST_CASE("BitStream: RakNet types and strings at their extremes match RakNet", 
     });
 }
 
+TEST_CASE("BitStream: Huffman strings match RakNet's string compressor", "[interop][bitstream]")
+{
+    std::string every_byte;
+    for (int c = 1; c < 256; ++c)
+        every_byte.push_back(static_cast<char>(c));
+    std::vector<Step> steps{
+        huffman_string(""),
+        scalar(true),
+        huffman_string("ab"),
+        huffman_string("Hello, World! 0x7F~"),
+        scalar(false),
+        huffman_string(every_byte),
+        huffman_string(std::string(65534, 'e')),
+        scalar(true),
+        huffman_string(std::string(3000, '\xFF')),
+    };
+    // One-byte strings: every padding case.
+    for (int c = 1; c < 256; ++c)
+    {
+        steps.push_back(huffman_string(std::string(1, static_cast<char>(c))));
+        steps.push_back(scalar(c % 3 == 0));
+    }
+    check_against_raknet(steps);
+}
+
 TEST_CASE("BitStream: RakNet types and strings match RakNet at every bit offset", "[interop][bitstream]")
 {
     const auto offset = static_cast<std::size_t>(GENERATE(range(0, 8)));

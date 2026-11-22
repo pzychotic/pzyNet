@@ -2,7 +2,7 @@
 
 // Steps and generators for RakNet's own types and strings (ticket #5), on the harness in
 // bit_stream_oracle.hpp: 24-bit integers, GUIDs, IPv4 system addresses, length-prefixed strings and
-// wide strings.
+// wide strings; and Huffman-compressed strings (ticket #14).
 //
 // Where the fork differs from upstream RakNet 4.081 (ADR-0003):
 // - Wide strings: the fork deleted RakWString, so there is no RakNet function to call. wide_string()
@@ -17,6 +17,7 @@
 #include "bit_stream_oracle.hpp"
 
 #include "RakNetTypes.h"
+#include "StringCompressor.h"
 
 #include <array>
 #include <cstring>
@@ -123,6 +124,31 @@ inline Step wide_string(std::u16string text)
     return step;
 }
 
+/// RakNet's StringCompressor singleton exists only while someone holds a reference (RakPeer's
+/// constructor normally takes one). Take one for the rest of the run, before the first Huffman step.
+inline void hold_string_compressor()
+{
+    static const bool held = (RakNet::StringCompressor::AddReference(), true);
+    (void)held;
+}
+
+/// A Huffman-compressed string (write_huffman_string / the fork's WriteCompressed(std::string),
+/// upstream's WriteCompressed(RakString)). Without zero bytes, which neither RakNet can encode.
+inline Step huffman_string(std::string text)
+{
+    hold_string_compressor();
+    Step step;
+    step.what = "Huffman string of " + std::to_string(text.size()) + " bytes";
+    step.write_ours = [text](rn::BitStreamWriter& out) { out.write_huffman_string(text); };
+    step.write_theirs = [text](RakNet::BitStream& out) { out.WriteCompressed(text); };
+    step.read_ours = [text](rn::BitStreamReader& in) { return in.read_huffman_string() == text; };
+    step.read_theirs = [text](RakNet::BitStream& in) {
+        std::string read = "junk";
+        return in.ReadCompressed(read) && read == text;
+    };
+    return step;
+}
+
 inline std::string random_text(Rng& rng, std::size_t max_size)
 {
     std::string text(random_size(rng, 0, max_size), '\0');
@@ -139,10 +165,23 @@ inline std::u16string random_wide_text(Rng& rng, std::size_t max_size)
     return text;
 }
 
-/// 24-bit integers, GUIDs, IPv4 addresses, strings (empty ones included) and wide strings.
+/// Mostly printable ASCII, where the English frequency table gives short codes.
+inline std::string random_english_text(Rng& rng, std::size_t max_size)
+{
+    static const char alphabet[] = "etaoin shrdlu ETAOIN SHRDLU cmfwyp vbgkqjxz 0123456789 .,;:!?'\"-()\n";
+    std::string text(random_size(rng, 0, max_size), '\0');
+    for (char& c : text)
+        c = alphabet[random_size(rng, 0, sizeof alphabet - 2)];
+    return text;
+}
+
+/// 24-bit integers, GUIDs, IPv4 addresses, strings (empty ones included), wide strings and
+/// Huffman strings.
 inline std::vector<StepGenerator> raknet_type_generators()
 {
     return {
+        [](Rng& rng) { return huffman_string(random_text(rng, 12)); },
+        [](Rng& rng) { return huffman_string(random_english_text(rng, 40)); },
         [](Rng& rng) { return uint24(static_cast<std::uint32_t>(rng())); },
         [](Rng& rng) { return guid(rng()); },
         [](Rng& rng) {
