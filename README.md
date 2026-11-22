@@ -187,8 +187,10 @@ for (;;) {
 - `set_timeout(remote, ms)` overrides the time-out for one connection, `set_timeout(ms)` sets it for all
   (RakNet's `SetTimeoutTime`). `external_address(remote)` is this Peer's address as that remote system
   reported it during the handshake (RakNet's `GetExternalID`).
-- `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
-  anyone.
+- `shutdown(linger)` with a positive linger closes every connection gracefully and waits, at most
+  that long, until the remote systems have acknowledged the pending reliable data and their
+  disconnection notification (in either threading mode). `shutdown()` with zero linger, and the
+  destructor, stop at once without notifying anyone; the remotes see a lost connection.
 - Timestamped messages work as in RakPeer: send `id::timestamp`, `peer.time()` (8 bytes) and then the
   real message id. On receipt the time is converted into the receiver's clock using the connection's
   measured clock offset; it is rewritten in the data and available as `packet->timestamp`, and

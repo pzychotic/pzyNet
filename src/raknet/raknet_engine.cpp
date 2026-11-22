@@ -837,6 +837,24 @@ std::size_t RakNetEngine::connection_count() const noexcept
     return impl_->by_id.size();
 }
 
+std::vector<ConnectionId> RakNetEngine::connections() const
+{
+    std::vector<ConnectionId> ids;
+    ids.reserve(impl_->by_id.size());
+    for (const auto& entry : impl_->by_id)
+        ids.push_back(entry.first);
+    return ids;
+}
+
+std::size_t RakNetEngine::closing_count() const noexcept
+{
+    std::size_t count = 0;
+    for (const auto& entry : impl_->by_endpoint)
+        if (entry.second->state == State::closing)
+            ++count;
+    return count;
+}
+
 std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) const
 {
     const Connection* connection = impl_->find(id);
