@@ -48,11 +48,14 @@ struct Packet
     static constexpr std::size_t timestamp_header_size = 9;
 };
 
+/// Numbers a send (Peer::send() returns it); receipt Packets carry it. Never 0 for an accepted send.
+using ReceiptNumber = std::uint32_t;
+
 /// The receipt number of an id::snd_receipt_acked or id::snd_receipt_loss Packet: the 4 bytes after the
 /// id, in host byte order as RakNet stores them. 0 if the Packet is too short.
-inline std::uint32_t receipt_number(const Packet& packet) noexcept
+inline ReceiptNumber receipt_number(const Packet& packet) noexcept
 {
-    std::uint32_t number = 0;
+    ReceiptNumber number = 0;
     if (packet.data.size() >= 1 + sizeof number)
         std::memcpy(&number, packet.data.data() + 1, sizeof number);
     return number;

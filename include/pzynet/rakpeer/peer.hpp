@@ -148,13 +148,14 @@ public:
     }
 
     /// Closes a connection; with DisconnectMode::graceful, the remote system is notified once pending
-    /// reliable data is delivered. Produces no Packet. An unknown remote yields Errc::not_connected.
+    /// reliable data is delivered. Produces no Packet; messages from the remote system that were already
+    /// received are still delivered by receive(). An unknown remote yields Errc::not_connected.
     void disconnect(const Remote& remote, transport::DisconnectMode mode, std::error_code& ec);
-    /// As above, but unknown remotes are ignored.
     void disconnect(const Remote& remote, transport::DisconnectMode mode = transport::DisconnectMode::graceful)
     {
         std::error_code ec;
         disconnect(remote, mode, ec);
+        detail::throw_if(ec, "Peer::disconnect");
     }
 
     /// Sends a message, which must start with its message id; ids the protocol reserves for itself
@@ -163,20 +164,20 @@ public:
     /// was requested. With SendOptions::ack_receipt, a receipt Packet carrying that number reports the
     /// outcome: [id::snd_receipt_acked or id::snd_receipt_loss][uint32 number], the number in host byte
     /// order as RakNet writes it (receipt_number() reads it).
-    std::uint32_t send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec);
-    std::uint32_t send(const Remote& to, ByteView data, const SendOptions& options = SendOptions())
+    ReceiptNumber send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec);
+    ReceiptNumber send(const Remote& to, ByteView data, const SendOptions& options = SendOptions())
     {
         std::error_code ec;
-        const std::uint32_t receipt = send(to, data, options, ec);
+        const ReceiptNumber receipt = send(to, data, options, ec);
         detail::throw_if(ec, "Peer::send");
         return receipt;
     }
-    std::uint32_t send(const Remote& to, const BitStreamWriter& message, const SendOptions& options,
+    ReceiptNumber send(const Remote& to, const BitStreamWriter& message, const SendOptions& options,
                        std::error_code& ec)
     {
         return send(to, message.data(), options, ec);
     }
-    std::uint32_t send(const Remote& to, const BitStreamWriter& message, const SendOptions& options = SendOptions())
+    ReceiptNumber send(const Remote& to, const BitStreamWriter& message, const SendOptions& options = SendOptions())
     {
         return send(to, message.data(), options);
     }
@@ -193,16 +194,36 @@ public:
         ban(address, duration, ec);
         detail::throw_if(ec, "Peer::ban");
     }
-    /// Removes exactly this entry from the ban list.
-    void unban(std::string_view address);
-    void clear_bans();
+    /// Removes exactly this entry from the ban list. Errc::not_open while not running.
+    void unban(std::string_view address, std::error_code& ec);
+    void unban(std::string_view address)
+    {
+        std::error_code ec;
+        unban(address, ec);
+        detail::throw_if(ec, "Peer::unban");
+    }
+    /// Empties the ban list. Errc::not_open while not running.
+    void clear_bans(std::error_code& ec);
+    void clear_bans()
+    {
+        std::error_code ec;
+        clear_bans(ec);
+        detail::throw_if(ec, "Peer::clear_bans");
+    }
     /// True if `address` (dotted) is banned. False while not running.
     bool is_banned(std::string_view address) const;
 
     /// RakNet's SetLimitIPConnectionFrequency: refuse, with id::ip_recently_connected, a connection
-    /// attempt from an IP that set up a connection less than 100 ms before. Also settable through
-    /// PeerConfig::engine. Ignored while not running.
-    void set_limit_ip_connection_frequency(bool limit);
+    /// attempt from an IP that set up a connection less than 100 ms before. This host's own addresses
+    /// (its interfaces' IPv4 addresses, the bound address and the external address) are exempt, as in
+    /// RakNet. Also settable through PeerConfig::engine. Errc::not_open while not running.
+    void set_limit_ip_connection_frequency(bool limit, std::error_code& ec);
+    void set_limit_ip_connection_frequency(bool limit)
+    {
+        std::error_code ec;
+        set_limit_ip_connection_frequency(limit, ec);
+        detail::throw_if(ec, "Peer::set_limit_ip_connection_frequency");
+    }
 
     /// Diagnostics of the connection to `remote`; Errc::not_connected if there is none.
     ConnectionStats statistics(const Remote& remote, std::error_code& ec) const;
@@ -224,8 +245,15 @@ public:
         detail::throw_if(ec, "Peer::set_timeout");
     }
     /// Sets the time-out of every connection and of future ones, replacing per-connection values
-    /// (RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS). Non-positive values are ignored.
-    void set_timeout(std::chrono::milliseconds timeout);
+    /// (RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS). Errc::not_open while not running,
+    /// Errc::invalid_argument unless positive.
+    void set_timeout(std::chrono::milliseconds timeout, std::error_code& ec);
+    void set_timeout(std::chrono::milliseconds timeout)
+    {
+        std::error_code ec;
+        set_timeout(timeout, ec);
+        detail::throw_if(ec, "Peer::set_timeout");
+    }
     /// The time-out of the connection to `remote`; nullopt if not connected.
     std::optional<std::chrono::milliseconds> timeout(const Remote& remote) const;
 
@@ -290,22 +318,22 @@ public:
 
     /// Sends a message to every connected system except `exclude`, as send() does. All copies share one
     /// receipt number; with acknowledgement, each system's copy reports on its own receipt Packet.
-    std::uint32_t broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
+    ReceiptNumber broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
                             std::error_code& ec);
-    std::uint32_t broadcast(ByteView data, const SendOptions& options = SendOptions(),
+    ReceiptNumber broadcast(ByteView data, const SendOptions& options = SendOptions(),
                             const std::optional<Remote>& exclude = std::nullopt)
     {
         std::error_code ec;
-        const std::uint32_t receipt = broadcast(data, options, exclude, ec);
+        const ReceiptNumber receipt = broadcast(data, options, exclude, ec);
         detail::throw_if(ec, "Peer::broadcast");
         return receipt;
     }
-    std::uint32_t broadcast(const BitStreamWriter& message, const SendOptions& options,
+    ReceiptNumber broadcast(const BitStreamWriter& message, const SendOptions& options,
                             const std::optional<Remote>& exclude, std::error_code& ec)
     {
         return broadcast(message.data(), options, exclude, ec);
     }
-    std::uint32_t broadcast(const BitStreamWriter& message, const SendOptions& options = SendOptions(),
+    ReceiptNumber broadcast(const BitStreamWriter& message, const SendOptions& options = SendOptions(),
                             const std::optional<Remote>& exclude = std::nullopt)
     {
         return broadcast(message.data(), options, exclude);

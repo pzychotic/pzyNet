@@ -56,7 +56,7 @@ std::error_code check(ByteView data, const SendOptions& options) noexcept
     return std::error_code();
 }
 
-transport::SendOptions transport_options(const SendOptions& options, std::uint32_t receipt) noexcept
+transport::SendOptions transport_options(const SendOptions& options, ReceiptNumber receipt) noexcept
 {
     transport::SendOptions result;
     result.reliability = options.reliability;
@@ -64,6 +64,13 @@ transport::SendOptions transport_options(const SendOptions& options, std::uint32
     result.priority = options.priority;
     result.receipt_token = options.ack_receipt ? receipt : 0;
     return result;
+}
+
+/// Sets `ec` to Errc::not_open unless `running`, and clears it otherwise; returns `running`.
+bool check_running(bool running, std::error_code& ec) noexcept
+{
+    ec = running ? std::error_code() : make_error_code(Errc::not_open);
+    return running;
 }
 
 } // namespace
@@ -76,6 +83,9 @@ struct Peer::Impl
         Guid guid;
         Endpoint address;
         bool incoming = false;
+        /// disconnect() closed it; kept until the engine's Disconnected event, so that messages already
+        /// received still name their sender, but hidden from lookups and the connection list.
+        bool closed = false;
     };
 
     explicit Impl(PeerConfig config_)
@@ -87,17 +97,21 @@ struct Peer::Impl
     RakNetEngine engine;
     transport::UdpHost host;
 
+    /// Held by receive() from popping an event until its Packet is made, so that concurrent receivers
+    /// translate events in order: the connection table never lags behind a Packet already handed out.
+    std::mutex receive_mutex;
+
     std::mutex mutex; // guards everything below
     std::map<transport::ConnectionId, Entry> connections;
-    std::uint32_t next_receipt = 1;
+    ReceiptNumber next_receipt = 1;
 
     /// The time as the engine sees it.
-    TimePoint clock_now() const { return config.clock ? config.clock() : Clock::now(); }
+    TimePoint clock_now() const { return pzynet::now(config.clock); }
 
     /// The next receipt number; 0 is skipped, as in RakPeer. Requires `mutex`.
-    std::uint32_t take_receipt() noexcept
+    ReceiptNumber take_receipt() noexcept
     {
-        const std::uint32_t receipt = next_receipt++;
+        const ReceiptNumber receipt = next_receipt++;
         if (next_receipt == 0)
             next_receipt = 1;
         return receipt;
@@ -110,6 +124,8 @@ struct Peer::Impl
             return transport::invalid_connection; // the unassigned GUID names nobody
         for (const auto& entry : connections)
         {
+            if (entry.second.closed)
+                continue;
             const bool match = std::holds_alternative<Guid>(remote)
                                    ? entry.second.guid == std::get<Guid>(remote)
                                    : entry.second.address == std::get<Endpoint>(remote);
@@ -119,16 +135,28 @@ struct Peer::Impl
         return transport::invalid_connection;
     }
 
+    /// The connection to `remote`, or transport::invalid_connection and Errc::not_connected.
+    transport::ConnectionId lookup(const Remote& remote, std::error_code& ec)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const transport::ConnectionId connection = find(remote);
+        ec = connection == transport::invalid_connection ? make_error_code(Errc::not_connected)
+                                                         : std::error_code();
+        return connection;
+    }
+
+    std::optional<ConnectionInfo> connection_info(transport::ConnectionId connection)
+    {
+        return host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+    }
+
     std::optional<ConnectionInfo> info(const Remote& remote)
     {
-        transport::ConnectionId connection = transport::invalid_connection;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            connection = find(remote);
-        }
-        if (connection == transport::invalid_connection)
+        std::error_code ec;
+        const transport::ConnectionId connection = lookup(remote, ec);
+        if (ec)
             return std::nullopt;
-        return host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+        return connection_info(connection);
     }
 
     Packet make_packet(std::uint8_t message_id, const Entry& from) const
@@ -148,8 +176,7 @@ struct Peer::Impl
     /// ShiftIncomingTimestamp does (unsigned wrap-around; no measured offset means no shift).
     void to_local_time(Packet& packet, transport::ConnectionId connection)
     {
-        const std::optional<ConnectionInfo> info =
-            host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+        const std::optional<ConnectionInfo> info = connection_info(connection);
         const std::uint64_t offset =
             info && info->clock_offset ? static_cast<std::uint64_t>(info->clock_offset->count()) : 0;
 
@@ -168,8 +195,7 @@ struct Peer::Impl
     {
         if (const auto* connected = std::get_if<transport::Connected>(&event))
         {
-            const std::optional<ConnectionInfo> info = host.with_engine(
-                [&](transport::Engine&) { return engine.connection_info(connected->connection); });
+            const std::optional<ConnectionInfo> info = connection_info(connected->connection);
             const Entry remote{Guid{info ? info->remote_guid : 0}, connected->remote, connected->incoming};
             std::lock_guard<std::mutex> lock(mutex);
             connections[connected->connection] = remote;
@@ -191,7 +217,7 @@ struct Peer::Impl
                 return std::nullopt;
             const Entry remote = it->second;
             connections.erase(it);
-            if (disconnected->reason == transport::DisconnectReason::closed_locally)
+            if (remote.closed || disconnected->reason == transport::DisconnectReason::closed_locally)
                 return std::nullopt;
             return make_packet(disconnected->reason == transport::DisconnectReason::closed_by_peer
                                    ? id::disconnection_notification
@@ -221,13 +247,13 @@ struct Peer::Impl
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 const auto it = connections.find(receipt->connection);
-                if (it == connections.end()) // closed by this Peer meanwhile
+                if (it == connections.end() || it->second.closed) // closed by this Peer meanwhile
                     return std::nullopt;
                 remote = it->second;
             }
             const std::uint8_t receipt_id = receipt->delivered ? id::snd_receipt_acked : id::snd_receipt_loss;
             Packet packet = make_packet(receipt_id, remote);
-            const std::uint32_t number = receipt->token;
+            const ReceiptNumber number = receipt->token;
             packet.data.resize(1 + sizeof number);
             std::memcpy(packet.data.data() + 1, &number, sizeof number); // host byte order, as RakNet does
             return packet;
@@ -334,6 +360,14 @@ void Peer::start(PeerConfig config, std::error_code& ec)
     }
     const Threading threading = config.threading;
     const Endpoint bind = config.bind;
+    // The engine does no I/O, so it learns this host's own addresses (exempt from the reconnect limit,
+    // as RakNet's internal IDs are) from here: the host name's addresses and a specific bound address.
+    std::error_code ignored; // without them, only the external address is exempt
+    std::vector<IpAddress>& local = config.engine.local_addresses;
+    for (const IpAddress& address : host_addresses(ignored))
+        local.push_back(address);
+    if (!bind.address().is_unspecified())
+        local.push_back(bind.address());
     auto impl = std::make_unique<Impl>(std::move(config));
     impl->host.bind(bind, ec);
     if (!ec && threading == Threading::background)
@@ -379,23 +413,14 @@ std::uint64_t Peer::time() const
 
 void Peer::connect(const Endpoint& to, ByteView password, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
-        return;
-    }
-    impl_->host.connect(to, password, ec);
+    if (check_running(running(), ec))
+        impl_->host.connect(to, password, ec);
 }
 
 void Peer::connect(std::string_view host, std::uint16_t port, ByteView password, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
+    if (!check_running(running(), ec))
         return;
-    }
     const std::vector<Endpoint> endpoints = resolve(host, port, ResolveFamily::v4, ec);
     if (ec)
         return;
@@ -409,33 +434,29 @@ void Peer::connect(std::string_view host, std::uint16_t port, ByteView password,
 
 void Peer::disconnect(const Remote& remote, transport::DisconnectMode mode, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
+    if (!check_running(running(), ec))
         return;
-    }
     transport::ConnectionId connection = transport::invalid_connection;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         connection = impl_->find(remote);
-        impl_->connections.erase(connection);
-    }
-    if (connection == transport::invalid_connection)
-    {
-        ec = make_error_code(Errc::not_connected);
-        return;
+        if (connection == transport::invalid_connection)
+        {
+            ec = make_error_code(Errc::not_connected);
+            return;
+        }
+        impl_->connections[connection].closed = true;
     }
     impl_->host.disconnect(connection, mode);
 }
 
-std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec)
+ReceiptNumber Peer::send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec)
 {
     ec = impl_ ? check(data, options) : make_error_code(Errc::not_open);
     if (ec)
         return 0;
     transport::ConnectionId connection = transport::invalid_connection;
-    std::uint32_t receipt = 0;
+    ReceiptNumber receipt = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         connection = impl_->find(to);
@@ -453,27 +474,20 @@ std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& opt
 
 void Peer::ban(std::string_view address, std::chrono::milliseconds duration, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
-        return;
-    }
-    const bool added = impl_->host.with_engine(
-        [&](transport::Engine&) { return impl_->engine.ban(address, duration, impl_->clock_now()); });
-    if (!added)
-        ec = make_error_code(Errc::invalid_argument);
+    if (check_running(running(), ec))
+        impl_->host.with_engine(
+            [&](transport::Engine&) { impl_->engine.ban(address, duration, impl_->clock_now(), ec); });
 }
 
-void Peer::unban(std::string_view address)
+void Peer::unban(std::string_view address, std::error_code& ec)
 {
-    if (impl_)
+    if (check_running(running(), ec))
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.unban(address); });
 }
 
-void Peer::clear_bans()
+void Peer::clear_bans(std::error_code& ec)
 {
-    if (impl_)
+    if (check_running(running(), ec))
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.clear_bans(); });
 }
 
@@ -485,29 +499,20 @@ bool Peer::is_banned(std::string_view address) const
         [&](transport::Engine&) { return impl_->engine.is_banned(address, impl_->clock_now()); });
 }
 
-void Peer::set_limit_ip_connection_frequency(bool limit)
+void Peer::set_limit_ip_connection_frequency(bool limit, std::error_code& ec)
 {
-    if (impl_)
+    if (check_running(running(), ec))
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_limit_ip_connection_frequency(limit); });
 }
 
 ConnectionStats Peer::statistics(const Remote& remote, std::error_code& ec) const
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
+    if (!check_running(running(), ec))
         return ConnectionStats();
-    }
-    transport::ConnectionId connection = transport::invalid_connection;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        connection = impl_->find(remote);
-    }
+    const transport::ConnectionId connection = impl_->lookup(remote, ec);
     const std::optional<ConnectionStats> stats =
-        connection == transport::invalid_connection
-            ? std::nullopt
-            : impl_->host.with_engine([&](transport::Engine&) { return impl_->engine.connection_stats(connection); });
+        ec ? std::nullopt
+           : impl_->host.with_engine([&](transport::Engine&) { return impl_->engine.connection_stats(connection); });
     if (!stats)
     {
         ec = make_error_code(Errc::not_connected);
@@ -518,31 +523,26 @@ ConnectionStats Peer::statistics(const Remote& remote, std::error_code& ec) cons
 
 void Peer::set_timeout(const Remote& remote, std::chrono::milliseconds timeout, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
+    if (!check_running(running(), ec))
         return;
-    }
-    transport::ConnectionId connection = transport::invalid_connection;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        connection = impl_->find(remote);
-    }
-    if (connection == transport::invalid_connection)
-    {
-        ec = make_error_code(Errc::not_connected);
+    const transport::ConnectionId connection = impl_->lookup(remote, ec);
+    if (ec)
         return;
-    }
     impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_timeout(connection, timeout, ec); });
     if (ec == Errc::unknown_connection) // gone in the meantime
         ec = make_error_code(Errc::not_connected);
 }
 
-void Peer::set_timeout(std::chrono::milliseconds timeout)
+void Peer::set_timeout(std::chrono::milliseconds timeout, std::error_code& ec)
 {
-    if (impl_)
-        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_timeout(timeout); });
+    if (!check_running(running(), ec))
+        return;
+    if (timeout.count() <= 0)
+    {
+        ec = make_error_code(Errc::invalid_argument);
+        return;
+    }
+    impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_timeout(timeout); });
 }
 
 std::optional<std::chrono::milliseconds> Peer::timeout(const Remote& remote) const
@@ -575,6 +575,8 @@ std::vector<RemoteSystem> Peer::connections() const
         std::lock_guard<std::mutex> lock(impl_->mutex);
         for (const auto& entry : impl_->connections)
         {
+            if (entry.second.closed)
+                continue;
             RemoteSystem system;
             system.guid = entry.second.guid;
             system.address = entry.second.address;
@@ -619,70 +621,55 @@ std::optional<Endpoint> Peer::address_of(const Guid& guid) const
 
 void Peer::ping(const Endpoint& to, bool only_if_accepting, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
-        return;
-    }
-    impl_->host.with_engine([&](transport::Engine&) { impl_->engine.ping(to, only_if_accepting); });
+    if (check_running(running(), ec))
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.ping(to, only_if_accepting); });
 }
 
 void Peer::advertise(const Endpoint& to, ByteView data, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
-        return;
-    }
-    impl_->host.with_engine([&](transport::Engine&) { impl_->engine.advertise(to, data, ec); });
+    if (check_running(running(), ec))
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.advertise(to, data, ec); });
 }
 
 void Peer::set_offline_ping_response(ByteView data, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-        ec = make_error_code(Errc::not_open);
-    else if (data.size() > max_offline_data)
-        ec = make_error_code(Errc::message_too_large);
+    if (!check_running(running(), ec))
+        return;
+    if (data.size() > max_offline_data)
+        ec = make_error_code(Errc::invalid_argument);
     else
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_offline_ping_response(data); });
 }
 
 void Peer::set_max_incoming_connections(std::size_t count, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-        ec = make_error_code(Errc::not_open);
-    else
+    if (check_running(running(), ec))
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_max_incoming_connections(count); });
 }
 
 void Peer::set_incoming_password(ByteView password, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-        ec = make_error_code(Errc::not_open);
-    else if (password.size() > max_password)
+    if (!check_running(running(), ec))
+        return;
+    if (password.size() > max_password)
         ec = make_error_code(Errc::invalid_argument);
     else
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_incoming_password(password); });
 }
 
-std::uint32_t Peer::broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
+ReceiptNumber Peer::broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
                               std::error_code& ec)
 {
     ec = impl_ ? check(data, options) : make_error_code(Errc::not_open);
     if (ec)
         return 0;
     std::vector<transport::ConnectionId> targets;
-    std::uint32_t receipt = 0;
+    ReceiptNumber receipt = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         const transport::ConnectionId excluded = exclude ? impl_->find(*exclude) : transport::invalid_connection;
         for (const auto& entry : impl_->connections)
-            if (entry.first != excluded)
+            if (entry.first != excluded && !entry.second.closed)
                 targets.push_back(entry.first);
         receipt = impl_->take_receipt(); // taken even with nobody to send to, as RakPeer does
     }
@@ -705,6 +692,7 @@ std::optional<Packet> Peer::receive()
 {
     if (!impl_)
         return std::nullopt;
+    std::lock_guard<std::mutex> lock(impl_->receive_mutex);
     transport::Event event;
     while (impl_->host.poll_event(event))
         if (std::optional<Packet> packet = impl_->translate(event))
@@ -714,13 +702,8 @@ std::optional<Packet> Peer::receive()
 
 void Peer::update(std::chrono::milliseconds max_wait, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
-        return;
-    }
-    impl_->host.update(max_wait, ec);
+    if (check_running(running(), ec))
+        impl_->host.update(max_wait, ec);
 }
 
 } // namespace raknet

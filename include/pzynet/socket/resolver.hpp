@@ -32,4 +32,16 @@ inline std::vector<Endpoint> resolve(std::string_view host, std::uint16_t port,
     return endpoints;
 }
 
+/// This system's own IPv4 addresses: what the local host name resolves to, as RakNet's GetMyIP finds
+/// them (gethostbyname(gethostname())). Blocks.
+std::vector<IpAddress> host_addresses(std::error_code& ec);
+
+inline std::vector<IpAddress> host_addresses()
+{
+    std::error_code ec;
+    std::vector<IpAddress> addresses = host_addresses(ec);
+    detail::throw_if(ec, "host_addresses");
+    return addresses;
+}
+
 } // namespace pzynet

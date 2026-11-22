@@ -156,7 +156,9 @@ int run_client(const std::string& server_name, std::uint16_t port)
             }
             if (connected && input->closed && input->lines.empty() && !leaving)
             {
-                peer.disconnect(server); // graceful: queued lines are delivered first
+                // Graceful: queued lines are delivered first. The server may have gone meanwhile.
+                std::error_code ignored;
+                peer.disconnect(server, pzynet::transport::DisconnectMode::graceful, ignored);
                 leaving = true;
             }
         }

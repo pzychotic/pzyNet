@@ -4,6 +4,7 @@
 
 #include "pzynet/raknet/message_ids.hpp"
 #include "pzynet/raknet/wire.hpp"
+#include "pzynet/socket/resolver.hpp"
 #include "pzynet/socket/udp_socket.hpp"
 
 #include "rakpeer/peer_test_support.hpp"
@@ -100,6 +101,33 @@ TEST_CASE("Peer: a remote close arrives as a disconnection notification; a local
     std::error_code ec;
     client.send(server.guid(), std::vector<std::uint8_t>{id::user_packet_enum}, SendOptions(), ec);
     CHECK(ec == Errc::not_connected);
+}
+
+TEST_CASE("Peer: a message received before a local close still names its sender", "[rakpeer]")
+{
+    Network net;
+    auto [server, client] = net.connected_pair(Threading::app_driven);
+    client.send(server.guid(), std::vector<std::uint8_t>{id::user_packet_enum, 7});
+    // Run the network long enough for the message to reach the server, without receiving it.
+    const auto until = SteadyClock::now() + 300ms;
+    while (SteadyClock::now() < until)
+        net.pump();
+
+    const Guid client_guid = client.guid();
+    const Endpoint client_address = client.local_endpoint();
+    server.disconnect(client_guid);
+
+    const std::optional<Packet> packet = server.receive();
+    REQUIRE(packet);
+    CHECK(packet->id == id::user_packet_enum);
+    CHECK(packet->guid == client_guid);
+    CHECK(packet->address == client_address);
+    CHECK(server.connections().empty());
+    CHECK_FALSE(server.guid_of(client_address));
+    std::error_code ec;
+    server.send(client_guid, std::vector<std::uint8_t>{id::user_packet_enum}, SendOptions(), ec);
+    CHECK(ec == Errc::not_connected);
+    CHECK_FALSE(server.receive());
 }
 
 TEST_CASE("Peer: statistics are reported for a connected remote and refused for an unknown one", "[rakpeer]")
@@ -414,6 +442,7 @@ TEST_CASE("Peer: addressing an unknown GUID or endpoint reports an error and sen
     CHECK(ec == Errc::not_connected);
     client.disconnect(unknown, transport::DisconnectMode::graceful, ec);
     CHECK(ec == Errc::not_connected);
+    CHECK_THROWS_AS(client.disconnect(unknown), std::system_error);
     CHECK_FALSE(client.address_of(Guid{}));
 
     CHECK_FALSE(net.wait_for_packet(server, 300ms));
@@ -447,7 +476,7 @@ TEST_CASE("Peer: an offline ping returns the configured response as a pong Packe
 
     std::error_code ec;
     server.set_offline_ping_response(std::vector<std::uint8_t>(400), ec);
-    CHECK(ec == Errc::message_too_large);
+    CHECK(ec == Errc::invalid_argument);
 }
 
 TEST_CASE("Peer: a ping for accepting systems only is answered while an incoming slot is free",
@@ -834,6 +863,12 @@ TEST_CASE("Peer: the ban list reports misuse through the error code", "[rakpeer]
     peer.ban("1.2.3.4", 0ms, ec);
     CHECK(ec == Errc::not_open);
     CHECK_FALSE(peer.is_banned("1.2.3.4"));
+    peer.unban("1.2.3.4", ec);
+    CHECK(ec == Errc::not_open);
+    peer.clear_bans(ec);
+    CHECK(ec == Errc::not_open);
+    CHECK_THROWS_AS(peer.unban("1.2.3.4"), std::system_error);
+    CHECK_THROWS_AS(peer.clear_bans(), std::system_error);
 
     peer.start(loopback_config(Threading::app_driven));
     peer.ban("", 0ms, ec);
@@ -841,8 +876,44 @@ TEST_CASE("Peer: the ban list reports misuse through the error code", "[rakpeer]
     peer.ban("1.2.3.4", 1h, ec);
     CHECK_FALSE(ec);
     CHECK(peer.is_banned("1.2.3.4"));
-    peer.clear_bans();
+    peer.clear_bans(ec);
+    CHECK_FALSE(ec);
     CHECK_FALSE(peer.is_banned("1.2.3.4"));
+    peer.ban("1.2.3.4");
+    peer.unban("1.2.3.4", ec);
+    CHECK_FALSE(ec);
+    CHECK_FALSE(peer.is_banned("1.2.3.4"));
+}
+
+TEST_CASE("Peer: connection-wide settings report a Peer that is not running", "[rakpeer]")
+{
+    Peer peer;
+    std::error_code ec;
+    peer.set_limit_ip_connection_frequency(true, ec);
+    CHECK(ec == Errc::not_open);
+    peer.set_timeout(1s, ec);
+    CHECK(ec == Errc::not_open);
+    CHECK_THROWS_AS(peer.set_limit_ip_connection_frequency(true), std::system_error);
+    CHECK_THROWS_AS(peer.set_timeout(1s), std::system_error);
+
+    peer.start(loopback_config(Threading::app_driven));
+    peer.set_limit_ip_connection_frequency(true, ec);
+    CHECK_FALSE(ec);
+    peer.set_timeout(1s, ec);
+    CHECK_FALSE(ec);
+    peer.set_timeout(0ms, ec);
+    CHECK(ec == Errc::invalid_argument);
+}
+
+TEST_CASE("Peer: configuration values over their limit are invalid arguments", "[rakpeer]")
+{
+    Peer peer;
+    peer.start(loopback_config(Threading::app_driven));
+    std::error_code ec;
+    peer.set_offline_ping_response(std::vector<std::uint8_t>(400, 'x'), ec);
+    CHECK(ec == Errc::invalid_argument);
+    peer.set_incoming_password(std::vector<std::uint8_t>(256, 'x'), ec);
+    CHECK(ec == Errc::invalid_argument);
 }
 
 TEST_CASE("Peer: a client reconnecting too quickly gets an IP-recently-connected Packet", "[rakpeer][reconnect]")
@@ -868,4 +939,43 @@ TEST_CASE("Peer: a client reconnecting too quickly gets an IP-recently-connected
     const std::optional<Packet> refused = net.wait_for_packet(second);
     REQUIRE(refused);
     CHECK(refused->id == id::ip_recently_connected);
+}
+
+TEST_CASE("Peer: the reconnect limit spares clients on this host's own addresses", "[rakpeer][reconnect]")
+{
+    // The server listens on every interface. A first client reaches it over loopback, so the external
+    // address the server learns is 127.0.0.1; clients on the host's own address are exempt anyway, as
+    // RakNet exempts its internal IDs.
+    std::error_code ec;
+    const std::vector<IpAddress> own = host_addresses(ec);
+    if (ec || own.empty())
+        SKIP("the host name does not resolve");
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    Network net;
+    PeerConfig server_config = loopback_config(threading, 4);
+    server_config.bind = Endpoint(IpAddress::any_v4(), 0);
+    server_config.engine.limit_ip_connection_frequency = true;
+    Peer& server = net.add(server_config);
+    Peer& probe = net.add(loopback_config(threading));
+    probe.connect(Endpoint(IpAddress::loopback_v4(), server.local_endpoint().port()));
+    REQUIRE(net.wait_for_packet(probe));
+    REQUIRE(net.wait_for_packet(server));
+    std::this_thread::sleep_for(150ms); // past the probe's window, whatever IP it used
+
+    // A loopback host address (Linux's 127.0.1.1) is reached via 127.0.0.1, which is where a server
+    // bound to every interface answers from; any other one directly.
+    const Endpoint server_address(own.front().is_loopback() ? IpAddress::loopback_v4() : own.front(),
+                                  server.local_endpoint().port());
+    PeerConfig client_config = loopback_config(threading);
+    client_config.bind = Endpoint(own.front(), 0);
+    Peer& first = net.add(client_config);
+    Peer& second = net.add(client_config);
+    first.connect(server_address);
+    const std::optional<Packet> accepted = net.wait_for_packet(first);
+    REQUIRE(accepted);
+    REQUIRE(accepted->id == id::connection_request_accepted);
+    second.connect(server_address);
+    const std::optional<Packet> also_accepted = net.wait_for_packet(second);
+    REQUIRE(also_accepted);
+    CHECK(also_accepted->id == id::connection_request_accepted);
 }

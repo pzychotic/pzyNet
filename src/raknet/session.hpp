@@ -6,6 +6,7 @@
 
 #include "pzynet/core/clock.hpp"
 #include "pzynet/core/span.hpp"
+#include "pzynet/raknet/raknet_engine.hpp"
 #include "pzynet/raknet/wire.hpp"
 #include "pzynet/transport/types.hpp"
 
@@ -64,14 +65,6 @@ struct Receipt
     bool delivered = false;
 };
 
-struct SessionCounters
-{
-    std::uint64_t bytes_sent = 0;
-    std::uint64_t bytes_received = 0;
-    std::uint64_t datagrams_resent = 0;
-    std::uint64_t datagrams_lost = 0;
-};
-
 class Session
 {
 public:
@@ -107,7 +100,7 @@ public:
     /// Smoothed round-trip time, once at least one acknowledgement arrived.
     std::optional<Duration> rtt() const;
 
-    const SessionCounters& counters() const noexcept { return counters_; }
+    const DatagramCounters& counters() const noexcept { return counters_; }
     /// Messages in the send queue (a split message counts once, until its last piece leaves).
     std::size_t queued_messages() const noexcept;
     /// Payload bytes in the send queue.
@@ -267,7 +260,7 @@ private:
     bool timed_out_ = false;
     bool violated_ = false;
 
-    SessionCounters counters_;
+    DatagramCounters counters_;
 };
 
 } // namespace detail

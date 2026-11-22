@@ -397,7 +397,7 @@ TEST_CASE("a banned address is refused with the connection-banned id", "[raknet]
             replies.push_back(datagram.data);
     };
 
-    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
+    server.engine.ban("10.0.0.2", 0ms, network.now);
     CHECK(server.engine.is_banned("10.0.0.2", network.now));
 
     std::error_code ec;
@@ -419,7 +419,7 @@ TEST_CASE("a ban for a duration expires", "[raknet][engine][ban]")
     Node& server = network.add(server_config());
     Node& client = network.add();
 
-    REQUIRE(server.engine.ban("10.0.0.2", 2s, network.now));
+    server.engine.ban("10.0.0.2", 2s, network.now);
     std::error_code ec;
     client.engine.connect(server.address, {}, ec);
     REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
@@ -435,10 +435,10 @@ TEST_CASE("banning again replaces the duration", "[raknet][engine][ban]")
 {
     Network network;
     Node& server = network.add(server_config());
-    REQUIRE(server.engine.ban("10.0.0.2", 1s, network.now));
-    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
+    server.engine.ban("10.0.0.2", 1s, network.now);
+    server.engine.ban("10.0.0.2", 0ms, network.now);
     CHECK(server.engine.is_banned("10.0.0.2", network.now + 24h));
-    REQUIRE(server.engine.ban("10.0.0.2", 1s, network.now));
+    server.engine.ban("10.0.0.2", 1s, network.now);
     CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now + 2s));
 }
 
@@ -447,8 +447,8 @@ TEST_CASE("unbanning and clearing the ban list let a client in again", "[raknet]
     Network network;
     Node& server = network.add(server_config());
     Node& client = network.add();
-    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
-    REQUIRE(server.engine.ban("10.0.0.3", 0ms, network.now));
+    server.engine.ban("10.0.0.2", 0ms, network.now);
+    server.engine.ban("10.0.0.3", 0ms, network.now);
 
     SECTION("unban")
     {
@@ -471,12 +471,12 @@ TEST_CASE("ban entries match like RakNet's", "[raknet][engine][ban]")
     RakNetEngine& engine = server.engine;
     const TimePoint now = network.now;
 
-    REQUIRE(engine.ban("10.0.0.2", 0ms, now));
+    engine.ban("10.0.0.2", 0ms, now);
     CHECK(engine.is_banned("10.0.0.2", now));
     CHECK_FALSE(engine.is_banned("10.0.0.20", now)); // no prefix match without a wildcard
     CHECK_FALSE(engine.is_banned("10.0.0.", now));
 
-    REQUIRE(engine.ban("192.168.*", 0ms, now));
+    engine.ban("192.168.*", 0ms, now);
     CHECK(engine.is_banned("192.168.1.7", now));
     CHECK(engine.is_banned("192.168.250.250", now));
     CHECK_FALSE(engine.is_banned("192.169.1.7", now));
@@ -484,11 +484,17 @@ TEST_CASE("ban entries match like RakNet's", "[raknet][engine][ban]")
     engine.unban("192.168"); // only the exact entry is removed
     CHECK(engine.is_banned("192.168.1.7", now));
 
-    CHECK_FALSE(engine.ban("", 0ms, now));
-    CHECK_FALSE(engine.ban("1234:5678:9abc::1", 0ms, now)); // longer than a dotted IPv4 address
+    std::error_code misuse;
+    engine.ban("", 0ms, now, misuse);
+    CHECK(misuse == Errc::invalid_argument);
+    engine.ban("1234:5678:9abc::1", 0ms, now, misuse); // longer than a dotted IPv4 address
+    CHECK(misuse == Errc::invalid_argument);
+    CHECK_THROWS_AS(engine.ban("", 0ms, now), std::system_error);
+    engine.ban("10.0.0.9", 0ms, now, misuse);
+    CHECK_FALSE(misuse);
 
     Node& client = network.add(); // 10.0.0.2 via the wildcard
-    REQUIRE(engine.ban("10.0.*", 0ms, now));
+    engine.ban("10.0.*", 0ms, now);
     engine.unban("10.0.0.2");
     std::error_code ec;
     client.engine.connect(server.address, {}, ec);
@@ -499,7 +505,7 @@ TEST_CASE("ban entries match like RakNet's", "[raknet][engine][ban]")
 TEST_CASE("a connection from a newly banned address times out", "[raknet][engine][ban]")
 {
     Session s;
-    REQUIRE(s.server.engine.ban("10.0.0.2", 0ms, s.network.now));
+    s.server.engine.ban("10.0.0.2", 0ms, s.network.now);
     send(s.client, s.at_client, user_message(1));
     REQUIRE(s.network.run_until([&] { return s.server.count<Disconnected>() == 1; }, 30s));
     CHECK(s.server.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
@@ -574,6 +580,46 @@ TEST_CASE("the reconnect limit does not apply to the engine's own IP", "[raknet]
     connect(network, first, server);
     connect(network, second, server);
     CHECK(network.now - start < 100ms); // the second attempt came within the window
+}
+
+TEST_CASE("the reconnect limit does not apply to the host's other local addresses",
+          "[raknet][engine][reconnect]")
+{
+    // RakNet also exempts every address of the host's interfaces (its internal IDs), not just the
+    // external one. The engine learns them from its driver.
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    const IpAddress other_interface = IpAddress::v4(10, 0, 0, 77);
+    config.local_addresses = {other_interface};
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(other_interface, 60001);
+    second.address = Endpoint(other_interface, 60002);
+
+    const TimePoint start = network.now;
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(network.now - start < 100ms);
+}
+
+TEST_CASE("local addresses can be replaced after construction", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    const IpAddress other_interface = IpAddress::v4(10, 0, 0, 78);
+    server.engine.set_local_addresses({other_interface});
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(other_interface, 60001);
+    second.address = Endpoint(other_interface, 60002);
+
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(server.engine.connection_count() == 2);
 }
 
 // --- delivering ----------------------------------------------------------------------------------

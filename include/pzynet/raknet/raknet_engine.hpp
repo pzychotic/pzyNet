@@ -30,8 +30,12 @@ struct Config
     std::vector<std::uint8_t> incoming_password;
     /// Refuse a connection attempt with id::ip_recently_connected when a connection from the same IP
     /// (any port) was set up less than 100 ms before, as RakNet's SetLimitIPConnectionFrequency does.
-    /// This engine's own external IP, once a handshake reported it, is exempt.
+    /// This engine's own addresses are exempt: the external IP, once a handshake reported it, and
+    /// local_addresses.
     bool limit_ip_connection_frequency = false;
+    /// This host's own IP addresses (RakNet's internal IDs: the addresses of its interfaces). The engine
+    /// does no I/O, so its driver supplies them; the reconnect limit does not apply to them.
+    std::vector<IpAddress> local_addresses;
 
     /// A connection is dropped when reliable data stays unacknowledged this long.
     std::chrono::milliseconds timeout{10000};
@@ -69,21 +73,26 @@ struct ConnectionInfo
     std::optional<Endpoint> external_address;
 };
 
-/// Basic diagnostics of one connection, counted since its handshake reached the reliability layer.
-struct ConnectionStats
+/// The datagram counters the reliability layer keeps for one connection.
+struct DatagramCounters
 {
     /// UDP payload bytes of the connection's datagrams (data, acknowledgements, retransmissions).
     std::uint64_t bytes_sent = 0;
     std::uint64_t bytes_received = 0;
-    /// Application messages: accepted by send(), and delivered as Message events. The engine's own
-    /// messages (handshake, pings, disconnection notice) are not counted.
-    std::uint64_t messages_sent = 0;
-    std::uint64_t messages_received = 0;
     /// Datagrams sent that carried at least one retransmitted message.
     std::uint64_t datagrams_resent = 0;
     /// Data datagrams the remote system reported missing (NAK) or that went unacknowledged until a
     /// retransmission time-out; each is counted once, even if it turns up later.
     std::uint64_t datagrams_lost = 0;
+};
+
+/// Basic diagnostics of one connection, counted since its handshake reached the reliability layer.
+struct ConnectionStats : DatagramCounters
+{
+    /// Application messages: accepted by send(), and delivered as Message events. The engine's own
+    /// messages (handshake, pings, disconnection notice) are not counted.
+    std::uint64_t messages_sent = 0;
+    std::uint64_t messages_received = 0;
     /// Messages waiting in the send queue, and their payload bytes. A split message counts once until
     /// its last piece leaves; the engine's own queued messages are included.
     std::size_t queued_messages = 0;
@@ -130,6 +139,7 @@ public:
     /// nullopt for a connection the application cannot see (unknown, closed or failed).
     std::optional<ConnectionStats> connection_stats(transport::ConnectionId connection) const;
     /// Every connection visible to the application (connected or still connecting), in no particular order.
+    /// A driver needs it (with closing_count()) to close handshaking connections too and linger until gone.
     std::vector<transport::ConnectionId> connections() const;
     /// Connections closed gracefully that are still getting their last data out; each goes once the
     /// remote has acknowledged everything, or after the time-out.
@@ -144,8 +154,15 @@ public:
     /// a '*' matches the rest of the address ("10.0.*"). A zero `duration` bans permanently,
     /// otherwise the ban ends `duration` after `now`. Banning an address again replaces its duration.
     /// Existing connections from a banned address are not closed; their traffic is dropped, so they
-    /// time out. Returns false (and changes nothing) for an empty or too long `address`.
-    bool ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now);
+    /// time out. Errc::invalid_argument (and nothing changes) for an empty or too long `address`.
+    void ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now,
+             std::error_code& ec);
+    void ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now)
+    {
+        std::error_code ec;
+        ban(address, duration, now, ec);
+        detail::throw_if(ec, "RakNetEngine::ban");
+    }
     /// Lifts the ban on exactly this entry (the same string that was banned).
     void unban(std::string_view address);
     void clear_bans();
@@ -154,6 +171,8 @@ public:
 
     /// RakNet's SetLimitIPConnectionFrequency (see Config::limit_ip_connection_frequency).
     void set_limit_ip_connection_frequency(bool limit);
+    /// Replaces Config::local_addresses.
+    void set_local_addresses(std::vector<IpAddress> addresses);
 
     /// Sets the time-out of one connection, overriding Config::timeout (RakNet's SetTimeoutTime for
     /// one system). Errc::unknown_connection for an unknown id, Errc::invalid_argument unless positive.

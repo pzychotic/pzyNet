@@ -149,7 +149,10 @@ struct RakNetEngine::Impl
     /// RakNet's reconnect limit: a connection from this IP was set up less than 100 ms ago.
     bool connected_recently(const IpAddress& address) const
     {
-        if (!config.limit_ip_connection_frequency || address == external_ip)
+        // RakNet's IsLoopbackAddressInCycle: this host's own addresses are exempt.
+        if (!config.limit_ip_connection_frequency || address == external_ip ||
+            std::find(config.local_addresses.begin(), config.local_addresses.end(), address) !=
+                config.local_addresses.end())
             return false;
         constexpr std::chrono::milliseconds window{100};
         return std::any_of(by_endpoint.begin(), by_endpoint.end(), [&](const auto& entry) {
@@ -968,11 +971,7 @@ std::optional<ConnectionStats> RakNetEngine::connection_stats(ConnectionId id) c
     stats.messages_received = connection->messages_received;
     if (const Session* session = connection->session.get())
     {
-        const detail::SessionCounters& counters = session->counters();
-        stats.bytes_sent = counters.bytes_sent;
-        stats.bytes_received = counters.bytes_received;
-        stats.datagrams_resent = counters.datagrams_resent;
-        stats.datagrams_lost = counters.datagrams_lost;
+        static_cast<DatagramCounters&>(stats) = session->counters();
         stats.queued_messages = session->queued_messages();
         stats.queued_bytes = session->queued_bytes();
     }
@@ -1027,10 +1026,15 @@ void RakNetEngine::set_offline_ping_response(ByteView data)
     impl_->config.offline_ping_response.assign(data.begin(), data.end());
 }
 
-bool RakNetEngine::ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now)
+void RakNetEngine::ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now,
+                       std::error_code& ec)
 {
+    ec.clear();
     if (address.empty() || address.size() > maximum_ban_length)
-        return false;
+    {
+        ec = make_error_code(Errc::invalid_argument);
+        return;
+    }
     std::optional<TimePoint> expiry;
     if (duration.count() > 0)
         expiry = now + duration;
@@ -1041,7 +1045,6 @@ bool RakNetEngine::ban(std::string_view address, std::chrono::milliseconds durat
         existing->expiry = expiry;
     else
         bans.push_back(Ban{std::string(address), expiry});
-    return true;
 }
 
 void RakNetEngine::unban(std::string_view address)
@@ -1064,6 +1067,11 @@ bool RakNetEngine::is_banned(std::string_view address, TimePoint now) const
 void RakNetEngine::set_limit_ip_connection_frequency(bool limit)
 {
     impl_->config.limit_ip_connection_frequency = limit;
+}
+
+void RakNetEngine::set_local_addresses(std::vector<IpAddress> addresses)
+{
+    impl_->config.local_addresses = std::move(addresses);
 }
 
 void RakNetEngine::ping(const Endpoint& to, bool only_if_accepting)

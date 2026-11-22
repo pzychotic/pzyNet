@@ -120,7 +120,7 @@ private:
     void notify() noexcept;    // makes the background thread re-evaluate the engine
     std::chrono::milliseconds wait_time(std::chrono::milliseconds cap, bool busy) const; // requires mutex_
     void run();
-    TimePoint now() const { return clock_ ? clock_() : Clock::now(); }
+    TimePoint now() const { return pzynet::now(clock_); }
 
     Engine& engine_;
     ClockSource clock_;

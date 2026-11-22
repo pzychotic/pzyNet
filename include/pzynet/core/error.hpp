@@ -11,11 +11,13 @@ namespace pzynet
 /// `ec == std::errc::operation_would_block` works identically on Windows and Linux.
 enum class Errc
 {
+    /// An argument out of range, including configuration values over their size limit.
     invalid_argument = 1,
     not_open,
     already_open,
     unknown_connection,
     not_connected,
+    /// Data to be sent exceeds what the protocol can carry.
     message_too_large,
     connection_limit_reached,
     reserved_message_id,
