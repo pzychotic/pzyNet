@@ -181,7 +181,7 @@ TEST_CASE("Peer: a broadcast reaches every connected system except the excluded 
         CHECK(first->data == Bytes{id::user_packet_enum, 1});
         CHECK(first->guid == server.guid());
     }
-    for (const int i : {0, 2})
+    for (const std::size_t i : {std::size_t{0}, std::size_t{2}})
     {
         const std::optional<Packet> second = net.wait_for_packet(*clients[i]);
         REQUIRE(second);
