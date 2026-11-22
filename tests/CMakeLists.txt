@@ -24,6 +24,7 @@ add_executable(pzynet_tests
     raknet/bit_stream_geometry_test.cpp
     raknet/bit_stream_compressed_test.cpp
     raknet/bit_stream_raknet_types_test.cpp
+    raknet/bit_stream_huffman_string_test.cpp
     raknet/wire_test.cpp
     raknet/engine_test.cpp
     raknet/connection_stats_test.cpp

@@ -347,6 +347,16 @@ public:
     /// with Errc::invalid_argument and write nothing (RakNet would write a truncated count).
     void write_wide_string(std::u16string_view text, std::error_code& ec);
     void write_wide_string(std::u16string_view text);
+    /// Writes a string Huffman-coded as RakNet's StringCompressor does with its default English
+    /// frequency table - what upstream's WriteCompressed(RakString) and WriteCompressed(const char*)
+    /// write (no language id): the number of code bits as write_compressed(std::uint32_t), then the
+    /// code bits, unaligned. The codes are padded to a whole number of bytes with the leading bits of
+    /// a longer code, and the padding counts towards the bit length. A string with a zero byte, at
+    /// which RakNet would stop, or of more than 65534 bytes, which RakNet would truncate silently,
+    /// fails with Errc::invalid_argument and writes nothing; the overload without `ec` throws
+    /// std::system_error.
+    void write_huffman_string(std::string_view text, std::error_code& ec);
+    void write_huffman_string(std::string_view text);
 
 private:
     void write_compressed_integer(std::uint64_t value, std::size_t width);
@@ -526,6 +536,12 @@ public:
     std::string read_string();
     /// Reads a wide string written by write_wide_string(). Returns an empty string on failure.
     std::u16string read_wide_string();
+    /// Reads a string written by write_huffman_string() (RakNet's ReadCompressed(RakString)): the
+    /// compressed bit length, then that many code bits. As in RakNet, the string ends at a decoded
+    /// zero byte, keeps at most 65534 bytes, and trailing bits that do not complete a code are
+    /// skipped; all of the announced bits are consumed. Fails, returning "", if the length cannot be
+    /// read or announces more bits than are left.
+    std::string read_huffman_string();
 
     /// Latches ok() == false, e.g. from a user type's read() hook that finds an invalid value.
     void fail() noexcept { ok_ = false; }
