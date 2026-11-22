@@ -200,6 +200,43 @@ TEST_CASE("Peer: a shut-down Peer can be started again", "[rakpeer]")
     CHECK(ec == Errc::already_open);
 }
 
+TEST_CASE("Peer: a connection with a shortened time-out is reported lost soon after the remote vanishes",
+          "[rakpeer]")
+{
+    Pair pair;
+    pair.client.set_timeout(pair.server.guid(), 1s);
+    CHECK(pair.client.timeout(pair.server.guid()) == 1s);
+
+    const auto vanished = std::chrono::steady_clock::now();
+    pair.server.shutdown(); // silently: the client is not told
+    const std::optional<Packet> lost = wait_for_packet(pair.client, 5s); // the default would be 10 s
+    REQUIRE(lost);
+    CHECK(lost->id == id::connection_lost);
+    CHECK(std::chrono::steady_clock::now() - vanished < 4s);
+}
+
+TEST_CASE("Peer: time-out calls name connections like send does", "[rakpeer]")
+{
+    Pair pair;
+    std::error_code ec;
+    pair.client.set_timeout(Guid{12345}, 1s, ec);
+    CHECK(ec == Errc::not_connected);
+    pair.client.set_timeout(pair.server.guid(), 0ms, ec);
+    CHECK(ec == Errc::invalid_argument);
+    CHECK_FALSE(pair.client.timeout(Guid{12345}));
+
+    pair.server.set_timeout(3s); // every connection, and the default for new ones
+    CHECK(pair.server.timeout(pair.client.guid()) == 3s);
+}
+
+TEST_CASE("Peer: each connection reports this Peer's address as the remote side saw it", "[rakpeer]")
+{
+    Pair pair;
+    CHECK(pair.client.external_address(pair.server.guid()) == pair.client.local_endpoint());
+    CHECK(pair.server.external_address(pair.client.local_endpoint()) == pair.server.local_endpoint());
+    CHECK_FALSE(pair.client.external_address(Guid{12345}));
+}
+
 namespace
 {
 
