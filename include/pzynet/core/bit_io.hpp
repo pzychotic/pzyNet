@@ -13,6 +13,12 @@ class BitWriter
 {
 public:
     explicit BitWriter(std::vector<std::uint8_t>& out) noexcept : out_(out) {}
+    /// Continues a bit stream of which `bits_used` bits are already in `out`, whose last byte may be
+    /// partly used. Requires out.size() == (bits_used + 7) / 8.
+    BitWriter(std::vector<std::uint8_t>& out, std::size_t bits_used) noexcept
+        : out_(out), used_(static_cast<unsigned>(bits_used & 7))
+    {
+    }
 
     void bit(bool value)
     {
@@ -42,6 +48,10 @@ public:
     explicit BitReader(ByteView data) noexcept : data_(data) {}
 
     bool ok() const noexcept { return ok_; }
+    /// Bits consumed so far.
+    std::size_t bit_position() const noexcept { return pos_; }
+    /// Bits left before the end of the data.
+    std::size_t bits_remaining() const noexcept { return pos_ < data_.size() * 8 ? data_.size() * 8 - pos_ : 0; }
     /// Bytes fully or partly consumed so far.
     std::size_t bytes_consumed() const noexcept { return (pos_ + 7) / 8; }
 

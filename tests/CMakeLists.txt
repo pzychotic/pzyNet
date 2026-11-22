@@ -20,6 +20,7 @@ add_executable(pzynet_tests
     socket/poller_test.cpp
     socket/resolver_test.cpp
     transport/udp_host_test.cpp
+    raknet/bit_stream_test.cpp
     raknet/wire_test.cpp
     raknet/engine_test.cpp)
 target_link_libraries(pzynet_tests PRIVATE
