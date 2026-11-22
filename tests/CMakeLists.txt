@@ -54,7 +54,7 @@ if(PZYNET_RAKNET_INTEROP_DIR)
         interop/raknet_interop_test.cpp
         interop/rakpeer_interop_test.cpp
         interop/bit_stream_interop_test.cpp
-        interop/bit_stream_compressed_interop_test.cpp)
+        interop/bit_stream_compressed_interop_test.cpp
         interop/bit_stream_raknet_types_interop_test.cpp)
     target_link_libraries(pzynet_interop_tests PRIVATE
         pzynet::transport pzynet::raknet pzynet::rakpeer RakNetStatic Catch2::Catch2WithMain)
