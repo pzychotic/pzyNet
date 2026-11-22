@@ -21,6 +21,7 @@ add_executable(pzynet_tests
     socket/resolver_test.cpp
     transport/udp_host_test.cpp
     raknet/bit_stream_test.cpp
+    raknet/bit_stream_geometry_test.cpp
     raknet/bit_stream_compressed_test.cpp
     raknet/bit_stream_raknet_types_test.cpp
     raknet/wire_test.cpp
@@ -54,6 +55,7 @@ if(PZYNET_RAKNET_INTEROP_DIR)
         interop/raknet_interop_test.cpp
         interop/rakpeer_interop_test.cpp
         interop/bit_stream_interop_test.cpp
+        interop/bit_stream_geometry_interop_test.cpp
         interop/bit_stream_compressed_interop_test.cpp
         interop/bit_stream_raknet_types_interop_test.cpp)
     target_link_libraries(pzynet_interop_tests PRIVATE
@@ -78,6 +80,7 @@ if(PZYNET_RAKNET_INTEROP_DIR)
     set_source_files_properties(${raknet_bitstream_sources} PROPERTIES COMPILE_OPTIONS $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
     add_executable(pzynet_interop_native_end_tests
         interop/bit_stream_interop_test.cpp
+        interop/bit_stream_geometry_interop_test.cpp
         interop/bit_stream_compressed_interop_test.cpp
         interop/bit_stream_raknet_types_interop_test.cpp
         ${raknet_bitstream_sources})

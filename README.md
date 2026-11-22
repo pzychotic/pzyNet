@@ -163,6 +163,18 @@ RakNet's space-saving encodings have their own calls, each with a matching read:
 exactly, quirks included: in a big-endian stream a compressed integer drops *trailing* zero bytes, so
 small numbers only shrink in little-endian streams, and negative numbers are never shortened.
 
+RakNet's quantized game-math helpers live in `pzynet/raknet/bit_stream_geometry.hpp`, over
+`raknet::Vector3<T>`, `Quaternion<T>` and `Matrix3<T>` (float or double components):
+`write_normalized_vector()` (6 bytes), `write_vector()` (length plus direction, 4 or 10 bytes),
+`write_normalized_quaternion()` and `write_orthogonal_matrix()` (52 bits each), and the matching
+`read_normalized_vector<T>(in)`, `read_vector<T>(in)`, ... They write what RakNet's `WriteNormVector`,
+`WriteVector`, `WriteNormQuat` and `WriteOrthMatrix` write, and read back RakNet's values exactly.
+
+```cpp
+raknet::write_orthogonal_matrix(out, raknet::Matrix3<float>{{{0, -1, 0}, {1, 0, 0}, {0, 0, 1}}});
+raknet::Matrix3<float> rotation = raknet::read_orthogonal_matrix<float>(in);
+```
+
 ## Peer
 
 `raknet::Peer` is a RakNet endpoint in a few lines: it owns the socket and the RakNet engine and runs the
