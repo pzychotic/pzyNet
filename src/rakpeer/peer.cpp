@@ -25,6 +25,7 @@ std::uint8_t failure_id(transport::ConnectFailure reason) noexcept
     case ConnectFailure::banned: return id::connection_banned;
     case ConnectFailure::invalid_credentials: return id::invalid_password;
     case ConnectFailure::unsupported: return id::remote_system_requires_public_key;
+    case ConnectFailure::ip_recently_connected: return id::ip_recently_connected;
     }
     return id::connection_attempt_failed;
 }
@@ -51,6 +52,9 @@ struct Peer::Impl
     std::mutex mutex; // guards everything below
     std::map<transport::ConnectionId, RemoteSystem> connections;
     std::uint32_t next_receipt = 1;
+
+    /// The time as the engine sees it.
+    TimePoint now() const { return config.clock ? config.clock() : Clock::now(); }
 
     /// Requires `mutex`.
     transport::ConnectionId find(const Remote& remote) const
@@ -224,6 +228,46 @@ std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& opt
     transport_options.priority = options.priority;
     impl_->host.send(connection, data, transport_options, ec);
     return ec ? 0 : receipt;
+}
+
+void Peer::ban(std::string_view address, std::chrono::milliseconds duration, std::error_code& ec)
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return;
+    }
+    const bool added = impl_->host.with_engine(
+        [&](transport::Engine&) { return impl_->engine.ban(address, duration, impl_->now()); });
+    if (!added)
+        ec = make_error_code(Errc::invalid_argument);
+}
+
+void Peer::unban(std::string_view address)
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.unban(address); });
+}
+
+void Peer::clear_bans()
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.clear_bans(); });
+}
+
+bool Peer::is_banned(std::string_view address) const
+{
+    if (!impl_)
+        return false;
+    return impl_->host.with_engine(
+        [&](transport::Engine&) { return impl_->engine.is_banned(address, impl_->now()); });
+}
+
+void Peer::set_limit_ip_connection_frequency(bool limit)
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_limit_ip_connection_frequency(limit); });
 }
 
 std::optional<Packet> Peer::receive()

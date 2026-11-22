@@ -150,6 +150,27 @@ struct RakNetEngine::Impl
     // Pings are stamped with the send time, so they wait for the next advance() to learn it.
     std::vector<std::pair<Endpoint, bool>> pending_pings;
     std::vector<Ban> bans;
+    // Our address as the first completed handshake reported it (RakNet's firstExternalID).
+    std::optional<IpAddress> external_ip;
+
+    void learn_external_address(const Endpoint& address)
+    {
+        if (!external_ip)
+            external_ip = address.address();
+    }
+
+    /// RakNet's reconnect limit: a connection from this IP was set up less than 100 ms ago.
+    bool connected_recently(const IpAddress& address) const
+    {
+        if (!config.limit_ip_connection_frequency || address == external_ip)
+            return false;
+        constexpr std::chrono::milliseconds window{100};
+        return std::any_of(by_endpoint.begin(), by_endpoint.end(), [&](const auto& entry) {
+            const Connection& other = *entry.second;
+            return other.state != State::dead && other.state != State::requesting &&
+                   other.remote.address() == address && now >= other.created && now - other.created < window;
+        });
+    }
 
     std::uint64_t now_ms() const noexcept { return RakNetEngine::wire_time(now); }
 
@@ -401,8 +422,10 @@ void RakNetEngine::Impl::handle_offline(std::uint8_t message_id, const Endpoint&
     case id::connection_banned:
         fail(*connection, ConnectFailure::banned);
         return;
-    case id::no_free_incoming_connections:
     case id::ip_recently_connected:
+        fail(*connection, ConnectFailure::ip_recently_connected);
+        return;
+    case id::no_free_incoming_connections:
     case id::connection_attempt_failed:
         fail(*connection, ConnectFailure::connection_refused);
         return;
@@ -459,6 +482,11 @@ void RakNetEngine::Impl::handle_request_2(const Endpoint& from, ByteView data)
     if (incoming_count() >= config.max_incoming_connections || by_endpoint.size() >= config.max_connections)
     {
         reject(id::no_free_incoming_connections);
+        return;
+    }
+    if (connected_recently(from.address()))
+    {
+        reject(id::ip_recently_connected);
         return;
     }
 
@@ -519,7 +547,10 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
         {
             wire::NewIncomingConnection incoming;
             if (wire::decode(payload, incoming))
+            {
                 record_clock(connection, incoming.accept_time, incoming.time);
+                learn_external_address(incoming.server_address);
+            }
             announce(connection);
         }
         else if (message_id == id::connected_ping)
@@ -540,6 +571,7 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
             if (!wire::decode(payload, accepted))
                 return;
             record_clock(connection, accepted.request_time, accepted.accept_time);
+            learn_external_address(accepted.client_address);
 
             wire::NewIncomingConnection reply;
             reply.server_address = connection.remote;

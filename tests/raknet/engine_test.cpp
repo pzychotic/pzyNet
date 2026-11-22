@@ -490,6 +490,74 @@ TEST_CASE("a connection from a newly banned address times out", "[raknet][engine
     CHECK(s.client.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
 }
 
+TEST_CASE("the reconnect limit refuses an IP that connects again within 100 ms", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    second.address = Endpoint(first.address.address(), 60001); // same IP, another port
+    std::vector<Bytes> replies;
+    network.tap = [&](const Network::Datagram& datagram) {
+        if (datagram.to == second.address && datagram.data[0] == id::ip_recently_connected)
+            replies.push_back(datagram.data);
+    };
+
+    std::error_code ec;
+    first.engine.connect(server.address, {}, ec);
+    network.run(1ms);
+    second.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return second.count<ConnectFailed>() == 1; }, 1s));
+    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::ip_recently_connected);
+    REQUIRE(replies.size() == 1);
+    wire::Rejection rejection;
+    REQUIRE(wire::decode(replies[0], rejection));
+    CHECK(rejection.guid == server.engine.guid());
+    REQUIRE(network.run_until([&] { return first.count<Connected>() == 1; }));
+
+    // Once the window has passed, the same IP is welcome again.
+    network.run(100ms);
+    connect(network, second, server);
+    CHECK(server.engine.connection_count() == 2);
+}
+
+TEST_CASE("without the reconnect limit an IP may connect again at once", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& first = network.add();
+    Node& second = network.add();
+    second.address = Endpoint(first.address.address(), 60001);
+
+    std::error_code ec;
+    first.engine.connect(server.address, {}, ec);
+    network.run(1ms);
+    second.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return server.count<Connected>() == 2; }, 1s));
+    CHECK(second.count<ConnectFailed>() == 0);
+}
+
+TEST_CASE("the reconnect limit does not apply to the engine's own IP", "[raknet][engine][reconnect]")
+{
+    // RakNet exempts its own addresses, among them the external address the first completed
+    // handshake reported. Here the server sees itself as 10.0.0.1, the IP these clients share.
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(server.address.address(), 60001);
+    second.address = Endpoint(server.address.address(), 60002);
+
+    const TimePoint start = network.now;
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(network.now - start < 100ms); // the second attempt came within the window
+}
+
 // --- delivering ----------------------------------------------------------------------------------
 
 TEST_CASE("every reliability delivers on a clean link", "[raknet][engine]")

@@ -169,3 +169,70 @@ TEST_CASE("Peer: a shut-down Peer can be started again", "[rakpeer]")
     peer.start(loopback_config(), ec);
     CHECK(ec == Errc::already_open);
 }
+
+TEST_CASE("Peer: a client of a server that banned its address gets a connection-banned Packet", "[rakpeer][ban]")
+{
+    Peer server;
+    server.start(loopback_config(4));
+    server.ban("127.0.0.*");
+    CHECK(server.is_banned("127.0.0.1"));
+    Peer client;
+    client.start(loopback_config());
+
+    client.connect(server.local_endpoint());
+    const std::optional<Packet> refused = wait_for_packet(client);
+    REQUIRE(refused);
+    CHECK(refused->id == id::connection_banned);
+    CHECK(refused->address == server.local_endpoint());
+
+    server.unban("127.0.0.*");
+    CHECK_FALSE(server.is_banned("127.0.0.1"));
+    client.connect(server.local_endpoint());
+    const std::optional<Packet> accepted = wait_for_packet(client);
+    REQUIRE(accepted);
+    CHECK(accepted->id == id::connection_request_accepted);
+}
+
+TEST_CASE("Peer: the ban list reports misuse through the error code", "[rakpeer][ban]")
+{
+    Peer peer;
+    std::error_code ec;
+    peer.ban("1.2.3.4", 0ms, ec);
+    CHECK(ec == Errc::not_open);
+    CHECK_FALSE(peer.is_banned("1.2.3.4"));
+
+    peer.start(loopback_config());
+    peer.ban("", 0ms, ec);
+    CHECK(ec == Errc::invalid_argument);
+    peer.ban("1.2.3.4", 1h, ec);
+    CHECK_FALSE(ec);
+    CHECK(peer.is_banned("1.2.3.4"));
+    peer.clear_bans();
+    CHECK_FALSE(peer.is_banned("1.2.3.4"));
+}
+
+TEST_CASE("Peer: a client reconnecting too quickly gets an IP-recently-connected Packet", "[rakpeer][reconnect]")
+{
+    Peer server;
+    PeerConfig server_config = loopback_config(4);
+    server_config.engine.limit_ip_connection_frequency = true;
+    server.start(server_config);
+
+    // The clients use another loopback IP: the server's own address is exempt from the limit.
+    PeerConfig client_config = loopback_config();
+    client_config.bind = Endpoint(IpAddress::v4(127, 0, 0, 2), 0);
+    Peer first;
+    first.start(client_config);
+    Peer second;
+    second.start(client_config);
+
+    // A loopback handshake takes a few milliseconds, well inside the 100 ms window.
+    first.connect(server.local_endpoint());
+    const std::optional<Packet> accepted = wait_for_packet(first);
+    REQUIRE(accepted);
+    REQUIRE(accepted->id == id::connection_request_accepted);
+    second.connect(server.local_endpoint());
+    const std::optional<Packet> refused = wait_for_packet(second);
+    REQUIRE(refused);
+    CHECK(refused->id == id::ip_recently_connected);
+}

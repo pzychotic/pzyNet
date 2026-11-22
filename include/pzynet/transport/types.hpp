@@ -57,6 +57,7 @@ enum class ConnectFailure
     banned,
     invalid_credentials,
     unsupported, ///< peer demands a feature this implementation lacks (e.g. transport security)
+    ip_recently_connected, ///< peer refuses another connection from this IP so soon after the last one
 };
 
 enum class DisconnectReason
