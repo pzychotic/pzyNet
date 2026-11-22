@@ -165,7 +165,7 @@ for (;;) {
 
 - `connect(endpoint, password)` reports its outcome as `id::connection_request_accepted` or one of
   RakNet's failure ids (`connection_attempt_failed`, `no_free_incoming_connections`, `invalid_password`,
-  `connection_banned`, `incompatible_protocol_version`, `already_connected`,
+  `connection_banned`, `incompatible_protocol_version`, `already_connected`, `ip_recently_connected`,
   `remote_system_requires_public_key`). An accepted connection on the other side is
   `id::new_incoming_connection`.
 - Remote systems are named by `raknet::Guid` or by `Endpoint`. `send()` takes a `BitStreamWriter` or raw
@@ -173,6 +173,10 @@ for (;;) {
   receipt number.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+- `ban(address, duration)` refuses an IPv4 address (`"192.168.*"` wildcards allowed; zero duration
+  bans permanently) with `id::connection_banned`; `unban()`, `clear_bans()` and `is_banned()` complete
+  RakNet's ban list. `set_limit_ip_connection_frequency(true)` (or `PeerConfig::engine`) refuses an IP
+  that connected less than 100 ms before with `id::ip_recently_connected`.
 - `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
   anyone.
 - `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out;

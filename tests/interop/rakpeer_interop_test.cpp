@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -317,4 +318,205 @@ TEST_CASE("Peer: after shutdown the RakPeer gets no notification and the port is
     std::error_code ec;
     again.start(config, ec);
     CHECK_FALSE(ec);
+}
+
+// --- ban list and reconnect limit ------------------------------------------------------------------
+//
+// Servers listen on 127.0.0.1, clients use 127.0.0.2: a RakPeer exempts its own addresses (and the
+// external address its first connection reported, 127.0.0.1 on loopback) from the reconnect limit.
+
+namespace
+{
+
+constexpr const char* client_ip = "127.0.0.2";
+
+enum class ServerKind
+{
+    rakpeer,
+    peer
+};
+
+const char* name(ServerKind kind)
+{
+    return kind == ServerKind::rakpeer ? "RakPeer server" : "Peer server";
+}
+
+/// A server on 127.0.0.1: a RakPeer or a pzyNet Peer, driven through the same calls.
+struct Server
+{
+    ServerKind kind;
+    rn::Peer peer;
+    RakNet::RakPeerInterface* rak = nullptr;
+
+    explicit Server(ServerKind kind_) : kind(kind_)
+    {
+        if (kind == ServerKind::rakpeer)
+        {
+            rak = RakNet::RakPeerInterface::GetInstance();
+            RakNet::SocketDescriptor descriptor(0, "127.0.0.1");
+            REQUIRE(rak->Startup(8, &descriptor, 1) == RakNet::RAKNET_STARTED);
+            rak->SetMaximumIncomingConnections(4);
+        }
+        else
+        {
+            rn::PeerConfig config;
+            config.bind = Endpoint(IpAddress::loopback_v4(), 0);
+            config.engine.max_incoming_connections = 4;
+            peer.start(config);
+        }
+    }
+    ~Server()
+    {
+        if (rak != nullptr)
+        {
+            rak->Shutdown(0);
+            RakNet::RakPeerInterface::DestroyInstance(rak);
+        }
+    }
+
+    std::uint16_t port() const
+    {
+        return rak != nullptr ? rak->GetMyBoundAddress(0).GetPort() : peer.local_endpoint().port();
+    }
+    Endpoint endpoint() const { return Endpoint(IpAddress::loopback_v4(), port()); }
+
+    void ban(const char* ip)
+    {
+        if (rak != nullptr)
+            rak->AddToBanList(ip, 0);
+        else
+            peer.ban(ip);
+    }
+    void limit_connection_frequency()
+    {
+        if (rak != nullptr)
+            rak->SetLimitIPConnectionFrequency(true);
+        else
+            peer.set_limit_ip_connection_frequency(true);
+    }
+};
+
+/// A RakPeer client bound to 127.0.0.2.
+struct RakClient
+{
+    RakNet::RakPeerInterface* rak = RakNet::RakPeerInterface::GetInstance();
+
+    RakClient()
+    {
+        RakNet::SocketDescriptor descriptor(0, client_ip);
+        REQUIRE(rak->Startup(1, &descriptor, 1) == RakNet::RAKNET_STARTED);
+    }
+    ~RakClient()
+    {
+        rak->Shutdown(0);
+        RakNet::RakPeerInterface::DestroyInstance(rak);
+    }
+
+    /// Connects and returns the id of the first connection outcome, or 0 if none arrives.
+    unsigned char connect(std::uint16_t port)
+    {
+        REQUIRE(rak->Connect("127.0.0.1", port, nullptr, 0) == RakNet::CONNECTION_ATTEMPT_STARTED);
+        const auto give_up = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < give_up)
+        {
+            while (RakNet::Packet* packet = rak->Receive())
+            {
+                const unsigned char id = packet->data[0];
+                rak->DeallocatePacket(packet);
+                switch (id)
+                {
+                case ID_CONNECTION_REQUEST_ACCEPTED:
+                case ID_CONNECTION_ATTEMPT_FAILED:
+                case ID_ALREADY_CONNECTED:
+                case ID_NO_FREE_INCOMING_CONNECTIONS:
+                case ID_CONNECTION_BANNED:
+                case ID_INVALID_PASSWORD:
+                case ID_INCOMPATIBLE_PROTOCOL_VERSION:
+                case ID_IP_RECENTLY_CONNECTED:
+                    return id;
+                default:
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        return 0;
+    }
+};
+
+/// A Peer client bound to 127.0.0.2.
+std::unique_ptr<rn::Peer> peer_client()
+{
+    auto peer = std::make_unique<rn::Peer>();
+    rn::PeerConfig config;
+    config.bind = Endpoint(IpAddress::v4(127, 0, 0, 2), 0);
+    peer->start(config);
+    return peer;
+}
+
+/// The id of the Peer's next Packet, or 0 if none arrives in time.
+std::uint8_t next_packet_id(rn::Peer& peer)
+{
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < give_up)
+    {
+        if (std::optional<rn::Packet> packet = peer.receive())
+            return packet->id;
+        std::this_thread::sleep_for(1ms);
+    }
+    return 0;
+}
+
+} // namespace
+
+TEST_CASE("a RakNet client is refused by a ban as by a RakPeer", "[interop][rakpeer][ban]")
+{
+    const ServerKind kind = GENERATE(ServerKind::rakpeer, ServerKind::peer);
+    INFO(name(kind));
+    Server server(kind);
+    server.ban("127.0.0.*");
+
+    RakClient client;
+    CHECK(client.connect(server.port()) == ID_CONNECTION_BANNED);
+}
+
+TEST_CASE("a RakNet client is refused by the reconnect limit as by a RakPeer", "[interop][rakpeer][reconnect]")
+{
+    const ServerKind kind = GENERATE(ServerKind::rakpeer, ServerKind::peer);
+    INFO(name(kind));
+    Server server(kind);
+    server.limit_connection_frequency();
+
+    RakClient first;
+    RakClient second;
+    REQUIRE(first.connect(server.port()) == ID_CONNECTION_REQUEST_ACCEPTED);
+    CHECK(second.connect(server.port()) == ID_IP_RECENTLY_CONNECTED);
+
+    // After the 100 ms window, the same IP may connect again.
+    std::this_thread::sleep_for(150ms);
+    RakClient third;
+    CHECK(third.connect(server.port()) == ID_CONNECTION_REQUEST_ACCEPTED);
+}
+
+TEST_CASE("Peer: a RakPeer's ban arrives as a connection-banned Packet", "[interop][rakpeer][ban]")
+{
+    Server server(ServerKind::rakpeer);
+    server.ban(client_ip);
+
+    const std::unique_ptr<rn::Peer> client = peer_client();
+    client->connect(server.endpoint());
+    CHECK(next_packet_id(*client) == rn::id::connection_banned);
+}
+
+TEST_CASE("Peer: a RakPeer's reconnect limit arrives as an IP-recently-connected Packet",
+          "[interop][rakpeer][reconnect]")
+{
+    Server server(ServerKind::rakpeer);
+    server.limit_connection_frequency();
+
+    RakClient first;
+    REQUIRE(first.connect(server.port()) == ID_CONNECTION_REQUEST_ACCEPTED);
+    const std::unique_ptr<rn::Peer> client = peer_client();
+    client->connect(server.endpoint());
+    CHECK(next_packet_id(*client) == rn::id::ip_recently_connected);
 }
