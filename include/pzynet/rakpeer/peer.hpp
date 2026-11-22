@@ -125,6 +125,16 @@ public:
         return send(to, message.data(), options);
     }
 
+    /// Diagnostics of the connection to `remote`; Errc::not_connected if there is none.
+    ConnectionStats statistics(const Remote& remote, std::error_code& ec) const;
+    ConnectionStats statistics(const Remote& remote) const
+    {
+        std::error_code ec;
+        ConnectionStats stats = statistics(remote, ec);
+        detail::throw_if(ec, "Peer::statistics");
+        return stats;
+    }
+
     /// The next Packet, if any. Never blocks.
     std::optional<Packet> receive();
 

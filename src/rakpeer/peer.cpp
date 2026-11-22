@@ -226,6 +226,31 @@ std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& opt
     return ec ? 0 : receipt;
 }
 
+ConnectionStats Peer::statistics(const Remote& remote, std::error_code& ec) const
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return ConnectionStats();
+    }
+    transport::ConnectionId connection = transport::invalid_connection;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        connection = impl_->find(remote);
+    }
+    const std::optional<ConnectionStats> stats =
+        connection == transport::invalid_connection
+            ? std::nullopt
+            : impl_->host.with_engine([&](transport::Engine&) { return impl_->engine.connection_stats(connection); });
+    if (!stats)
+    {
+        ec = make_error_code(Errc::not_connected);
+        return ConnectionStats();
+    }
+    return *stats;
+}
+
 std::optional<Packet> Peer::receive()
 {
     if (!impl_)

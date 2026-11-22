@@ -173,6 +173,10 @@ for (;;) {
   receipt number.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+- `statistics(remote)` returns a `raknet::ConnectionStats` for a connected remote: bytes and messages
+  sent and received, resent datagrams, datagrams presumed lost, and the send queue in messages and bytes
+  (the engine offers the same through `RakNetEngine::connection_stats()`). It is a small diagnostic
+  set, not RakNet's `RakNetStatistics`.
 - `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
   anyone.
 - `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out;

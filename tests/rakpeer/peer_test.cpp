@@ -131,6 +131,34 @@ TEST_CASE("Peer: a remote close arrives as a disconnection notification; a local
     CHECK(ec == Errc::not_connected);
 }
 
+TEST_CASE("Peer: statistics are reported for a connected remote and refused for an unknown one", "[rakpeer]")
+{
+    Pair pair;
+    const std::vector<std::uint8_t> message{id::user_packet_enum, 1, 2, 3};
+    pair.client.send(pair.server.guid(), message);
+    pair.client.send(pair.server.local_endpoint(), message);
+    REQUIRE(wait_for_packet(pair.server));
+    REQUIRE(wait_for_packet(pair.server));
+
+    const ConnectionStats by_guid = pair.client.statistics(pair.server.guid());
+    CHECK(by_guid.messages_sent == 2);
+    CHECK(by_guid.bytes_sent > 0);
+    CHECK(by_guid.bytes_received > 0);
+    const ConnectionStats at_server = pair.server.statistics(pair.client.local_endpoint());
+    CHECK(at_server.messages_received == 2);
+
+    std::error_code ec;
+    pair.client.statistics(Guid{0x1234}, ec);
+    CHECK(ec == Errc::not_connected);
+    pair.client.statistics(Endpoint(IpAddress::loopback_v4(), 1), ec);
+    CHECK(ec == Errc::not_connected);
+    CHECK_THROWS_AS(pair.client.statistics(Guid{0x1234}), std::system_error);
+
+    Peer stopped;
+    stopped.statistics(Guid{0x1234}, ec);
+    CHECK(ec == Errc::not_open);
+}
+
 TEST_CASE("Peer: shutdown, and destruction, stop the network and release the socket", "[rakpeer]")
 {
     const bool destroy = GENERATE(false, true);
