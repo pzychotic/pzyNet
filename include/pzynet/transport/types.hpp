@@ -53,11 +53,11 @@ enum class ConnectFailure
     no_response,
     incompatible_protocol,
     connection_refused, ///< peer has no free slot or does not accept connections
+    recently_connected, ///< peer refuses this address because it connected too recently
     already_connected,
     banned,
     invalid_credentials,
     unsupported, ///< peer demands a feature this implementation lacks (e.g. transport security)
-    recently_connected, ///< peer refuses another connection from this IP so soon after the last one
 };
 
 enum class DisconnectReason

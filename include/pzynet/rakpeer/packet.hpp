@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <vector>
 
@@ -46,6 +47,16 @@ struct Packet
     /// id::timestamp followed by the 8-byte time.
     static constexpr std::size_t timestamp_header_size = 9;
 };
+
+/// The receipt number of an id::snd_receipt_acked or id::snd_receipt_loss Packet: the 4 bytes after the
+/// id, in host byte order as RakNet stores them. 0 if the Packet is too short.
+inline std::uint32_t receipt_number(const Packet& packet) noexcept
+{
+    std::uint32_t number = 0;
+    if (packet.data.size() >= 1 + sizeof number)
+        std::memcpy(&number, packet.data.data() + 1, sizeof number);
+    return number;
+}
 
 } // namespace raknet
 } // namespace pzynet

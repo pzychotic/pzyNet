@@ -24,7 +24,8 @@ add_executable(pzynet_tests
     raknet/wire_test.cpp
     raknet/engine_test.cpp
     raknet/connection_stats_test.cpp
-    rakpeer/peer_test.cpp)
+    rakpeer/peer_test.cpp
+    rakpeer/peer_send_test.cpp)
 target_link_libraries(pzynet_tests PRIVATE
     pzynet::core pzynet::socket pzynet::transport pzynet::raknet pzynet::rakpeer Catch2::Catch2WithMain)
 target_include_directories(pzynet_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
