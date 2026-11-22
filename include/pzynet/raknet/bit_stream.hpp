@@ -3,6 +3,7 @@
 #include "pzynet/core/bit_io.hpp"
 #include "pzynet/core/span.hpp"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -110,6 +111,34 @@ T float_from_bits(std::uint64_t value) noexcept
     return result;
 }
 
+// --- compressed, delta, half-float and range-packed encodings ---
+
+// RakNet's compressed float in [-1, 1]: (unsigned short)((x + 1) * 32767.5f), after clamping.
+std::uint16_t compress_unit_float(float value) noexcept;
+float expand_unit_float(std::uint16_t value) noexcept;
+// RakNet's compressed double in [-1, 1]: (uint32_t)((x + 1) * 2^31), after clamping.
+std::uint32_t compress_unit_double(double value) noexcept;
+double expand_unit_double(std::uint32_t value) noexcept;
+
+/// Bits needed to hold `value`: 0 for 0, else the index of its highest set bit plus one.
+constexpr std::size_t bit_width(std::uint64_t value) noexcept
+{
+    std::size_t bits = 0;
+    for (; value != 0; value >>= 1)
+        ++bits;
+    return bits;
+}
+
+template <class T>
+using ranged_unsigned = std::make_unsigned_t<T>;
+
+template <class T>
+void check_ranged_type()
+{
+    static_assert(std::is_integral<T>::value && !std::is_same<T, bool>::value,
+                  "BitStream ranged integers: T must be an integer type");
+}
+
 } // namespace bit_stream_detail
 
 /// Writes RakNet's BitStream format: bit-packed, most significant bit first, with no regard for byte
@@ -169,7 +198,122 @@ public:
     /// (RakNet's AlignWriteToByteBoundary).
     void align() noexcept { bits_ = byte_count() * 8; }
 
+    // --- compressed, delta, half-float and range-packed encodings ---
+
+    /// Writes a value as RakNet's BitStream::WriteCompressed does:
+    /// - integers and enums (an enum as its underlying type): the value's bytes are taken in the
+    ///   stream's byte order and looked at from the last one back; each 0x00 byte costs a single 1 bit,
+    ///   and at the first other byte a 0 bit is written followed by that byte and all before it. If only
+    ///   the first byte is left, it takes a 1 bit and its low nibble when its high nibble is zero, else a
+    ///   0 bit and all 8 bits. Big-endian streams therefore drop *trailing* zero bytes: small numbers do
+    ///   not shrink there (5u takes 33 bits), they do in little-endian streams. Only 0x00 bytes are ever
+    ///   dropped; RakNet's 0xFF branch for negative numbers is never reached, so -1 takes 33 bits too.
+    /// - float, double in [-1, 1] (clamped): a uint16 (x + 1) * 32767.5 or a uint32 (x + 1) * 2^31,
+    ///   truncated, in the stream's byte order. As in RakNet on x86-64, a double of exactly 1.0
+    ///   overflows to 0 and reads back as -1.0.
+    /// - bool and any other type: written unchanged, as by write() (RakNet does the same for bool,
+    ///   RakNetGUID, SystemAddress and uint24_t).
+    template <class T>
+    void write_compressed(const T& value)
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            write_bit(value);
+        else if constexpr (std::is_enum<T>::value)
+            write_compressed(static_cast<std::underlying_type_t<T>>(value));
+        else if constexpr (std::is_integral<T>::value)
+            write_compressed_integer(static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<T>>(value)),
+                                     sizeof(T));
+        else if constexpr (std::is_same<T, float>::value)
+            write(bit_stream_detail::compress_unit_float(value));
+        else if constexpr (std::is_same<T, double>::value)
+            write(bit_stream_detail::compress_unit_double(value));
+        else
+            write(value);
+    }
+
+    /// RakNet's WriteDelta: a 0 bit if `current == last`, else a 1 bit and write(current). A bool is
+    /// written as itself, without the flag bit.
+    template <class T>
+    void write_delta(const T& current, const T& last)
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            write_bit(current);
+        else if (current == last)
+            write_bit(false);
+        else
+        {
+            write_bit(true);
+            write(current);
+        }
+    }
+    /// RakNet's WriteDelta without a last value: a 1 bit and write(current) - for a bool too, which
+    /// makes two bits that BitStreamReader::read_delta (one bit for a bool, as in RakNet) does not read.
+    template <class T>
+    void write_delta(const T& current)
+    {
+        write_bit(true);
+        write(current);
+    }
+    /// RakNet's WriteCompressedDelta: as write_delta(current, last), with write_compressed(current).
+    template <class T>
+    void write_compressed_delta(const T& current, const T& last)
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            write_bit(current);
+        else if (current == last)
+            write_bit(false);
+        else
+        {
+            write_bit(true);
+            write_compressed(current);
+        }
+    }
+    /// RakNet's WriteCompressedDelta without a last value: a 1 bit and write_compressed(current); a
+    /// bool is written as itself, without the flag bit.
+    template <class T>
+    void write_compressed_delta(const T& current)
+    {
+        if constexpr (!std::is_same<T, bool>::value)
+            write_bit(true);
+        write_compressed(current);
+    }
+
+    /// RakNet's WriteFloat16: `value` as a uint16 fraction of [min, max], 65535 * (value - min) /
+    /// (max - min) computed in float, clamped to [0, 65535] and truncated, in the stream's byte order.
+    /// NaN is written as 0. Requires max > min.
+    void write_float16(float value, float min, float max);
+
+    /// RakNet's WriteBitsFromIntegerRange: `value - min` in the fewest bits that hold `max - min`
+    /// (nothing at all when min == max), least significant byte first whatever the stream's byte
+    /// order, the bits of a partial last byte taken from its low end. With `allow_outside_range`, a
+    /// flag bit comes first, and a value outside [min, max] is written in full by write() after a 1
+    /// bit. Without it, the value must be in range (only its low bits would be written).
+    template <class T>
+    void write_ranged(T value, T min, T max, bool allow_outside_range = false)
+    {
+        bit_stream_detail::check_ranged_type<T>();
+        using U = bit_stream_detail::ranged_unsigned<T>;
+        assert(max >= min);
+        assert(allow_outside_range || (value >= min && value <= max));
+        if (allow_outside_range)
+        {
+            const bool outside = value < min || value > max;
+            write_bit(outside);
+            if (outside)
+            {
+                write(value);
+                return;
+            }
+        }
+        const U offset = static_cast<U>(static_cast<U>(value) - static_cast<U>(min));
+        const U span = static_cast<U>(static_cast<U>(max) - static_cast<U>(min));
+        write_ranged_offset(offset, bit_stream_detail::bit_width(span));
+    }
+
 private:
+    void write_compressed_integer(std::uint64_t value, std::size_t width);
+    void write_ranged_offset(std::uint64_t offset, std::size_t bit_count);
+
     void write_bit(bool value);
     void write_integer(std::uint64_t value, std::size_t width);
 
@@ -254,7 +398,91 @@ public:
     void skip_bits(std::size_t count) noexcept;
     void skip_bytes(std::size_t count) noexcept { skip_bits(count * 8); }
 
+    // --- compressed, delta, half-float and range-packed encodings ---
+
+    /// Reads a value written by BitStreamWriter::write_compressed(). Compressed floats come back
+    /// quantised: u16 / 32767.5 - 1 and u32 / 2^31 - 1.
+    template <class T>
+    T read_compressed()
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            return read_bit();
+        else if constexpr (std::is_enum<T>::value)
+            return static_cast<T>(read_compressed<std::underlying_type_t<T>>());
+        else if constexpr (std::is_integral<T>::value)
+            return static_cast<T>(static_cast<std::make_unsigned_t<T>>(read_compressed_integer(sizeof(T))));
+        else if constexpr (std::is_same<T, float>::value)
+        {
+            const auto packed = read<std::uint16_t>();
+            return ok_ ? bit_stream_detail::expand_unit_float(packed) : 0.0f;
+        }
+        else if constexpr (std::is_same<T, double>::value)
+        {
+            const auto packed = read<std::uint32_t>();
+            return ok_ ? bit_stream_detail::expand_unit_double(packed) : 0.0;
+        }
+        else
+            return read<T>();
+    }
+    /// read_compressed<T>() into `value`; returns ok().
+    template <class T>
+    bool read_compressed(T& value)
+    {
+        if constexpr (std::is_arithmetic<T>::value || std::is_enum<T>::value)
+            value = read_compressed<T>();
+        else
+            read(value);
+        return ok_;
+    }
+
+    /// Reads what BitStreamWriter::write_delta() wrote: a flag bit, then the value if the flag is 1;
+    /// on a 0 flag `value` keeps what it had. A bool is a single bit with no flag. Returns ok().
+    template <class T>
+    bool read_delta(T& value)
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            value = read_bit();
+        else if (read_bit())
+            read(value);
+        return ok_;
+    }
+    /// As read_delta(), for BitStreamWriter::write_compressed_delta().
+    template <class T>
+    bool read_compressed_delta(T& value)
+    {
+        if constexpr (std::is_same<T, bool>::value)
+            value = read_bit();
+        else if (read_bit())
+            read_compressed(value);
+        return ok_;
+    }
+
+    /// Reads what BitStreamWriter::write_float16() wrote: min + u16 / 65535 * (max - min), clamped to
+    /// [min, max]. Returns 0 if the read fails.
+    float read_float16(float min, float max);
+
+    /// Reads what BitStreamWriter::write_ranged() wrote with the same min, max and allow_outside_range.
+    /// When min == max no bits are read and min is returned (RakNet's read fails there, although its
+    /// writer wrote nothing).
+    template <class T>
+    T read_ranged(T min, T max, bool allow_outside_range = false)
+    {
+        bit_stream_detail::check_ranged_type<T>();
+        using U = bit_stream_detail::ranged_unsigned<T>;
+        assert(max >= min);
+        if (allow_outside_range && read_bit())
+            return read<T>();
+        const U span = static_cast<U>(static_cast<U>(max) - static_cast<U>(min));
+        const auto offset = static_cast<U>(read_ranged_offset(bit_stream_detail::bit_width(span)));
+        if (!ok_)
+            return T{};
+        return static_cast<T>(static_cast<U>(offset + static_cast<U>(min)));
+    }
+
 private:
+    std::uint64_t read_compressed_integer(std::size_t width);
+    std::uint64_t read_ranged_offset(std::size_t bit_count);
+
     bool read_bit();
     std::uint64_t read_integer(std::size_t width);
     bool need(std::size_t bits) noexcept;

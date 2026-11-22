@@ -77,54 +77,6 @@ inline std::uint16_t truncate_to_uint16(double value) noexcept
     return static_cast<std::uint16_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(value)));
 }
 
-// --- Quantized floats ---------------------------------------------------------------------------------
-// Local copies of the half-float and compressed-float encodings (ticket #4 adds them to the BitStream
-// itself; these can be replaced by those once both are in).
-
-/// RakNet's WriteFloat16(value, min, max): 65535 * (value - min) / (max - min) in float arithmetic,
-/// clamped to [0, 65535], truncated to a uint16 in the stream's byte order.
-inline void write_float16(BitStreamWriter& out, float value, float min, float max)
-{
-    float percentile = 65535.0f * (value - min) / (max - min);
-    if (percentile < 0.0f)
-        percentile = 0.0f;
-    if (percentile > 65535.0f)
-        percentile = 65535.0f;
-    out.write(truncate_to_uint16(percentile));
-}
-
-/// RakNet's ReadFloat16: min + (u16 / 65535) * (max - min), clamped to [min, max].
-inline float read_float16(BitStreamReader& in, float min, float max)
-{
-    const auto percentile = in.read<std::uint16_t>();
-    if (!in.ok())
-        return 0.0f;
-    float value = min + (static_cast<float>(percentile) / 65535.0f) * (max - min);
-    if (value < min)
-        value = min;
-    else if (value > max)
-        value = max;
-    return value;
-}
-
-/// RakNet's WriteCompressed(float): the value clamped to [-1, 1], as (uint16)((value + 1) * 32767.5)
-/// in float arithmetic, in the stream's byte order.
-inline void write_compressed_float(BitStreamWriter& out, float value)
-{
-    if (value < -1.0f)
-        value = -1.0f;
-    if (value > 1.0f)
-        value = 1.0f;
-    out.write(truncate_to_uint16((value + 1.0f) * 32767.5f));
-}
-
-/// RakNet's ReadCompressed(float): u16 / 32767.5 - 1.
-inline float read_compressed_float(BitStreamReader& in)
-{
-    const auto compressed = in.read<std::uint16_t>();
-    return in.ok() ? static_cast<float>(compressed) / 32767.5f - 1.0f : 0.0f;
-}
-
 } // namespace bit_stream_detail
 
 /// Writes a vector of length up to 1 as three half floats in [-1, 1] (RakNet's WriteNormVector):
@@ -133,9 +85,9 @@ template <class T>
 void write_normalized_vector(BitStreamWriter& out, const Vector3<T>& v)
 {
     bit_stream_detail::check_component_type<T>();
-    bit_stream_detail::write_float16(out, static_cast<float>(v.x), -1.0f, 1.0f);
-    bit_stream_detail::write_float16(out, static_cast<float>(v.y), -1.0f, 1.0f);
-    bit_stream_detail::write_float16(out, static_cast<float>(v.z), -1.0f, 1.0f);
+    out.write_float16(static_cast<float>(v.x), -1.0f, 1.0f);
+    out.write_float16(static_cast<float>(v.y), -1.0f, 1.0f);
+    out.write_float16(static_cast<float>(v.z), -1.0f, 1.0f);
 }
 
 /// Reads a vector written by write_normalized_vector(). Each component is within 2 / 65535 of the
@@ -146,9 +98,9 @@ Vector3<T> read_normalized_vector(BitStreamReader& in)
 {
     bit_stream_detail::check_component_type<T>();
     Vector3<T> v;
-    v.x = bit_stream_detail::read_float16(in, -1.0f, 1.0f);
-    v.y = bit_stream_detail::read_float16(in, -1.0f, 1.0f);
-    v.z = bit_stream_detail::read_float16(in, -1.0f, 1.0f);
+    v.x = in.read_float16(-1.0f, 1.0f);
+    v.y = in.read_float16(-1.0f, 1.0f);
+    v.z = in.read_float16(-1.0f, 1.0f);
     return in.ok() ? v : Vector3<T>{};
 }
 
@@ -163,9 +115,9 @@ void write_vector(BitStreamWriter& out, const Vector3<T>& v)
     out.write(static_cast<float>(length));
     if (length > 0.00001f)
     {
-        bit_stream_detail::write_compressed_float(out, static_cast<float>(v.x / length));
-        bit_stream_detail::write_compressed_float(out, static_cast<float>(v.y / length));
-        bit_stream_detail::write_compressed_float(out, static_cast<float>(v.z / length));
+        out.write_compressed(static_cast<float>(v.x / length));
+        out.write_compressed(static_cast<float>(v.y / length));
+        out.write_compressed(static_cast<float>(v.z / length));
     }
 }
 
@@ -180,9 +132,9 @@ Vector3<T> read_vector(BitStreamReader& in)
     Vector3<T> v;
     if (in.ok() && length > 0.00001f)
     {
-        v.x = bit_stream_detail::read_compressed_float(in);
-        v.y = bit_stream_detail::read_compressed_float(in);
-        v.z = bit_stream_detail::read_compressed_float(in);
+        v.x = in.read_compressed<float>();
+        v.y = in.read_compressed<float>();
+        v.z = in.read_compressed<float>();
         v.x *= length;
         v.y *= length;
         v.z *= length;
