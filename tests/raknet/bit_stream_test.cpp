@@ -159,3 +159,133 @@ TEST_CASE("BitStream: float and double are their IEEE 754 bits in the stream's b
     CHECK(from_little.read<double>() == -2.5);
     CHECK(from_little.ok());
 }
+
+TEST_CASE("BitStream: raw bits take whole bytes first, then the tail's low or high bits", "[raknet][bitstream]")
+{
+    // RakNet's WriteBits: with right alignment the last partial byte contributes its low bits,
+    // without it its high bits.
+    const Bytes right{0xAB, 0x05}; // tail 0x05 -> low 3 bits 101
+    const Bytes left{0xAB, 0xA0};  // tail 0xA0 -> high 3 bits 101
+
+    BitStreamWriter a;
+    a.write(true);
+    a.write_bits(right, 11);
+    BitStreamWriter b;
+    b.write(true);
+    b.write_bits(left, 11, false);
+
+    // 1 | 10101011 | 101 -> 1101 0101 1101 0000
+    CHECK(a.bit_count() == 12);
+    CHECK(bytes_of(a) == Bytes{0xD5, 0xD0});
+    CHECK(bytes_of(b) == Bytes{0xD5, 0xD0});
+
+    BitStreamReader reader(a.data());
+    CHECK(reader.read<bool>());
+    std::uint8_t out[2] = {0xEE, 0xEE};
+    CHECK(reader.read_bits(out, 11));
+    CHECK(Bytes(out, out + 2) == right);
+
+    BitStreamReader reader2(a.data());
+    CHECK(reader2.read<bool>());
+    CHECK(reader2.read_bits(out, 11, false));
+    CHECK(Bytes(out, out + 2) == left);
+    CHECK(reader2.ok());
+    CHECK(reader2.bits_remaining() == 4);
+}
+
+TEST_CASE("BitStream: zero raw bits write and read nothing", "[raknet][bitstream]")
+{
+    BitStreamWriter writer;
+    writer.write(true);
+    writer.write_bits(ByteView(), 0);
+    CHECK(writer.bit_count() == 1);
+
+    BitStreamReader reader(writer.data());
+    CHECK(reader.read_bits(MutableByteView(), 0)); // RakNet's ReadBits returns false here
+    CHECK(reader.bit_position() == 0);
+    CHECK(reader.ok());
+}
+
+TEST_CASE("BitStream: raw bytes go at the current bit position, aligned bytes after zero padding",
+          "[raknet][bitstream]")
+{
+    const Bytes payload{0x12, 0x34};
+
+    BitStreamWriter raw;
+    raw.write(true);
+    raw.write_bytes(payload);
+    // 1 | 00010010 | 00110100
+    CHECK(raw.bit_count() == 17);
+    CHECK(raw.byte_count() == 3);
+    CHECK(bytes_of(raw) == Bytes{0x89, 0x1A, 0x00});
+
+    BitStreamWriter aligned;
+    aligned.write(true);
+    aligned.write_aligned_bytes(payload);
+    aligned.write(true);
+    // 1 0000000 | 00010010 | 00110100 | 1
+    CHECK(aligned.bit_count() == 25);
+    CHECK(bytes_of(aligned) == Bytes{0x80, 0x12, 0x34, 0x80});
+
+    std::uint8_t out[2] = {};
+    BitStreamReader from_raw(raw.data());
+    CHECK(from_raw.read<bool>());
+    CHECK(from_raw.read_bytes(out));
+    CHECK(Bytes(out, out + 2) == payload);
+
+    BitStreamReader from_aligned(aligned.data());
+    CHECK(from_aligned.read<bool>());
+    CHECK(from_aligned.read_aligned_bytes(out));
+    CHECK(Bytes(out, out + 2) == payload);
+    CHECK(from_aligned.read<bool>());
+    CHECK(from_aligned.ok());
+}
+
+TEST_CASE("BitStream: aligning pads to the next byte boundary and does nothing on one", "[raknet][bitstream]")
+{
+    BitStreamWriter writer;
+    writer.align();
+    CHECK(writer.bit_count() == 0);
+    writer.write(true);
+    writer.align();
+    CHECK(writer.bit_count() == 8);
+    writer.align();
+    CHECK(writer.bit_count() == 8);
+    writer.write(std::uint8_t{0xFF});
+    writer.write(false);
+    writer.write(true);
+    writer.align();
+    CHECK(writer.bit_count() == 24);
+    CHECK(bytes_of(writer) == Bytes{0x80, 0xFF, 0x40});
+
+    // An empty aligned write still aligns, as RakNet's WriteAlignedBytes does.
+    writer.write(true);
+    writer.write_aligned_bytes(ByteView());
+    CHECK(writer.bit_count() == 32);
+
+    BitStreamReader reader(writer.data());
+    reader.align();
+    CHECK(reader.bit_position() == 0);
+    CHECK(reader.read<bool>());
+    reader.align();
+    CHECK(reader.bit_position() == 8);
+    CHECK(reader.read<std::uint8_t>() == 0xFF);
+    CHECK(reader.read<bool>() == false);
+    reader.align();
+    CHECK(reader.bit_position() == 24);
+    CHECK(reader.ok());
+}
+
+TEST_CASE("BitStream: skipping moves the read position by bits or bytes", "[raknet][bitstream]")
+{
+    const Bytes data{0x12, 0x34, 0x56, 0x78};
+    BitStreamReader reader(data);
+    CHECK(reader.bit_count() == 32);
+    reader.skip_bits(4);
+    CHECK(reader.read<std::uint8_t>() == 0x23);
+    reader.skip_bytes(1);
+    CHECK(reader.bit_position() == 20);
+    CHECK(reader.bits_remaining() == 12);
+    CHECK(reader.read<std::uint8_t>() == 0x67);
+    CHECK(reader.ok());
+}

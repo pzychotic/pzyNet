@@ -78,6 +78,8 @@ public:
     ByteOrder byte_order() const noexcept { return order_; }
     /// Bits written so far.
     std::size_t bit_count() const noexcept { return bits_; }
+    /// Bytes the written bits occupy, (bit_count() + 7) / 8.
+    std::size_t byte_count() const noexcept { return data_.size(); }
     /// The written bytes; the last one is zero-padded if bit_count() is not a multiple of 8.
     ByteView data() const noexcept { return ByteView(data_.data(), data_.size()); }
 
@@ -101,6 +103,25 @@ public:
             static_assert(bit_stream_detail::always_false<T>::value, "BitStreamWriter::write: unsupported type");
     }
 
+    /// Writes `bit_count` raw bits from `bytes`, as RakNet's WriteBits: whole bytes in order, most
+    /// significant bit first, then the remaining bit_count % 8 bits from the next byte - its low bits
+    /// when `right_aligned` (RakNet's default), its high bits otherwise. Requires
+    /// bytes.size() * 8 >= bit_count; bits beyond the view are never read.
+    void write_bits(ByteView bytes, std::size_t bit_count, bool right_aligned = true);
+    /// Writes raw bytes at the current bit position, without alignment or byte swapping
+    /// (RakNet's Write(const char*, unsigned)).
+    void write_bytes(ByteView bytes) { write_bits(bytes, bytes.size() * 8); }
+    /// Aligns to a byte boundary, then writes raw bytes (RakNet's WriteAlignedBytes). Aligns even
+    /// when `bytes` is empty.
+    void write_aligned_bytes(ByteView bytes)
+    {
+        align();
+        write_bytes(bytes);
+    }
+    /// Pads with zero bits up to the next byte boundary; nothing happens on a boundary
+    /// (RakNet's AlignWriteToByteBoundary).
+    void align() noexcept { bits_ = byte_count() * 8; }
+
 private:
     void write_bit(bool value);
     void write_integer(std::uint64_t value, std::size_t width);
@@ -123,6 +144,8 @@ public:
 
     ByteOrder byte_order() const noexcept { return order_; }
     bool ok() const noexcept { return ok_; }
+    /// Bits in the data, read or not: eight per byte of the view.
+    std::size_t bit_count() const noexcept { return bits_.bit_position() + bits_.bits_remaining(); }
     /// Bits consumed so far.
     std::size_t bit_position() const noexcept { return bits_.bit_position(); }
     /// Bits left to read; padding bits of the last byte count, as they do in RakNet.
@@ -143,6 +166,29 @@ public:
         else
             static_assert(bit_stream_detail::always_false<T>::value, "BitStreamReader::read: unsupported type");
     }
+
+    /// Reads `bit_count` raw bits into `out`, the inverse of BitStreamWriter::write_bits(): the first
+    /// (bit_count + 7) / 8 bytes of `out` are overwritten, a partial last byte holding the bits in its
+    /// low (`right_aligned`) or high end and zeros elsewhere. Reading zero bits succeeds and does
+    /// nothing (RakNet's ReadBits fails on zero). Fails, filling those bytes with zeros, if fewer bits
+    /// are left or `out` is too small.
+    bool read_bits(MutableByteView out, std::size_t bit_count, bool right_aligned = true);
+    /// Fills `out` with raw bytes from the current bit position (RakNet's Read(char*, unsigned)).
+    bool read_bytes(MutableByteView out) { return read_bits(out, out.size() * 8); }
+    /// Aligns to a byte boundary, then fills `out` (RakNet's ReadAlignedBytes). Aligns even when
+    /// `out` is empty, mirroring write_aligned_bytes(); RakNet instead fails without aligning.
+    bool read_aligned_bytes(MutableByteView out)
+    {
+        align();
+        return read_bytes(out);
+    }
+    /// Skips to the next byte boundary; nothing happens on a boundary (RakNet's
+    /// AlignReadToByteBoundary). Never moves past the end of the data.
+    void align() noexcept { bits_.align(); }
+    /// Moves the read position forward (RakNet's IgnoreBits / IgnoreBytes). Skipping past the end
+    /// fails the reader without moving; RakNet would only fail the next read.
+    void skip_bits(std::size_t count) noexcept;
+    void skip_bytes(std::size_t count) noexcept { skip_bits(count * 8); }
 
 private:
     bool read_bit();
