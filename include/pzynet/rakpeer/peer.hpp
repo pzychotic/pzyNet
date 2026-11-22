@@ -125,6 +125,26 @@ public:
         return send(to, message.data(), options);
     }
 
+    /// Sets how long reliable data to `remote` may stay unacknowledged before the connection is
+    /// reported lost, overriding PeerConfig::engine.timeout (RakNet's SetTimeoutTime for one system).
+    /// Errc::not_connected for an unknown remote, Errc::invalid_argument unless positive.
+    void set_timeout(const Remote& remote, std::chrono::milliseconds timeout, std::error_code& ec);
+    void set_timeout(const Remote& remote, std::chrono::milliseconds timeout)
+    {
+        std::error_code ec;
+        set_timeout(remote, timeout, ec);
+        detail::throw_if(ec, "Peer::set_timeout");
+    }
+    /// Sets the time-out of every connection and of future ones, replacing per-connection values
+    /// (RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS). Non-positive values are ignored.
+    void set_timeout(std::chrono::milliseconds timeout);
+    /// The time-out of the connection to `remote`; nullopt if not connected.
+    std::optional<std::chrono::milliseconds> timeout(const Remote& remote) const;
+
+    /// This Peer's address as `remote` reported it during the handshake (RakNet's GetExternalID);
+    /// behind a NAT it differs from local_endpoint(). nullopt if not connected.
+    std::optional<Endpoint> external_address(const Remote& remote) const;
+
     /// The next Packet, if any. Never blocks.
     std::optional<Packet> receive();
 

@@ -273,6 +273,39 @@ TEST_CASE("BitStream: the writer's bytes equal RakNet's for the same booleans an
           Bytes(theirs.GetData(), theirs.GetData() + theirs.GetNumberOfBytesUsed()));
 }
 
+TEST_CASE("Peer: the external address agrees with the RakPeer's view of the connection", "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    Fixture f;
+    f.establish(direction);
+
+    const auto endpoint_of = [](const RakNet::SystemAddress& address) {
+        return Endpoint::parse(address.ToString(true, ':'));
+    };
+    // The Peer's external address is where the RakPeer sees it...
+    const std::optional<Endpoint> external = f.peer.external_address(f.rak_guid());
+    REQUIRE(external);
+    CHECK(external == endpoint_of(f.peer_address));
+    // ...and the RakPeer's external address, which the Peer reported, is where the Peer sees it.
+    CHECK(endpoint_of(f.rak->GetExternalID(f.peer_address)) == f.rak_endpoint());
+}
+
+TEST_CASE("Peer: a shortened time-out notices a vanished RakPeer early", "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    Fixture f;
+    f.establish(direction);
+    f.peer.set_timeout(f.rak_guid(), 1s);
+
+    const auto vanished = std::chrono::steady_clock::now();
+    f.rak->Shutdown(0); // no notification
+    REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::connection_lost) == 1; }, 5s));
+    CHECK(std::chrono::steady_clock::now() - vanished < 4s);
+    CHECK(f.peer_last(rn::id::connection_lost).guid == f.rak_guid());
+}
+
 TEST_CASE("Peer: a RakPeer's close arrives as a disconnection notification", "[interop][rakpeer]")
 {
     const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);

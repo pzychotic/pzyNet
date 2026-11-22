@@ -66,6 +66,18 @@ struct Peer::Impl
         return transport::invalid_connection;
     }
 
+    std::optional<ConnectionInfo> info(const Remote& remote)
+    {
+        transport::ConnectionId connection = transport::invalid_connection;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connection = find(remote);
+        }
+        if (connection == transport::invalid_connection)
+            return std::nullopt;
+        return host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+    }
+
     Packet make_packet(std::uint8_t message_id, const RemoteSystem& from) const
     {
         Packet packet;
@@ -224,6 +236,55 @@ std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& opt
     transport_options.priority = options.priority;
     impl_->host.send(connection, data, transport_options, ec);
     return ec ? 0 : receipt;
+}
+
+void Peer::set_timeout(const Remote& remote, std::chrono::milliseconds timeout, std::error_code& ec)
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return;
+    }
+    transport::ConnectionId connection = transport::invalid_connection;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        connection = impl_->find(remote);
+    }
+    if (connection == transport::invalid_connection)
+    {
+        ec = make_error_code(Errc::not_connected);
+        return;
+    }
+    impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_timeout(connection, timeout, ec); });
+    if (ec == Errc::unknown_connection) // gone in the meantime
+        ec = make_error_code(Errc::not_connected);
+}
+
+void Peer::set_timeout(std::chrono::milliseconds timeout)
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_timeout(timeout); });
+}
+
+std::optional<std::chrono::milliseconds> Peer::timeout(const Remote& remote) const
+{
+    if (!impl_)
+        return std::nullopt;
+    const std::optional<ConnectionInfo> info = impl_->info(remote);
+    if (!info)
+        return std::nullopt;
+    return info->timeout;
+}
+
+std::optional<Endpoint> Peer::external_address(const Remote& remote) const
+{
+    if (!impl_)
+        return std::nullopt;
+    const std::optional<ConnectionInfo> info = impl_->info(remote);
+    if (!info)
+        return std::nullopt;
+    return info->external_address;
 }
 
 std::optional<Packet> Peer::receive()

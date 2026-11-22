@@ -95,7 +95,8 @@ A client calls `host.connect(endpoint, password)` and waits for `Connected` or `
 `SendOptions` select reliability (the five RakNet reliabilities), ordering channel (0–31), priority and
 an optional receipt token (RakNet's `*_WITH_ACK_RECEIPT`). Unconnected ping/pong and "advertise system"
 are available through `RakNetEngine::ping()` / `advertise()`; RakNet-specific state (GUIDs, MTU,
-round-trip time, clock offset) through `connection_info()`. From another thread, reach the engine with
+round-trip time, clock offset, time-out, external address) through `connection_info()`; time-outs per
+connection or for all with `set_timeout()`. From another thread, reach the engine with
 `host.with_engine(...)`. [examples/raknet_chat.cpp](examples/raknet_chat.cpp) is a complete program.
 
 Messages are passed through untouched. When the other side is a RakNet application, start payloads with a
@@ -173,6 +174,9 @@ for (;;) {
   receipt number.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+- `set_timeout(remote, ms)` overrides the time-out for one connection, `set_timeout(ms)` sets it for all
+  (RakNet's `SetTimeoutTime`). `external_address(remote)` is this Peer's address as that remote system
+  reported it during the handshake (RakNet's `GetExternalID`).
 - `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
   anyone.
 - `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out;
