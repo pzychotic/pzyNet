@@ -1,5 +1,6 @@
 // Live checks of the Peer and the BitStream against a real RakPeer, built from the checkout named by
-// PZYNET_RAKNET_INTEROP_DIR. Both sides run their own network thread over loopback UDP.
+// PZYNET_RAKNET_INTEROP_DIR. Both sides talk over loopback UDP; the RakPeer runs its own network thread,
+// the Peer its background thread or, where a test says so, also the app-driven mode.
 
 #include "pzynet/raknet/bit_stream.hpp"
 #include "pzynet/raknet/message_ids.hpp"
@@ -44,6 +45,11 @@ const char* name(Direction direction)
     return direction == Direction::peer_connects ? "Peer connects to RakPeer" : "RakPeer connects to Peer";
 }
 
+const char* threading_name(rn::Threading threading)
+{
+    return threading == rn::Threading::background ? "background thread" : "app-driven";
+}
+
 struct RakPacket
 {
     unsigned char id = 0;
@@ -63,17 +69,22 @@ struct Fixture
 
     RakNet::SystemAddress peer_address; // the Peer as the RakPeer sees it
 
-    static rn::PeerConfig peer_config(ClockSource peer_clock = ClockSource())
+    bool app_driven = false; // waiting runs the Peer's network
+
+    static rn::PeerConfig peer_config(ClockSource peer_clock = ClockSource(),
+                                      rn::Threading threading = rn::Threading::background)
     {
         rn::PeerConfig config;
         config.bind = Endpoint(IpAddress::loopback_v4(), 0);
         config.engine.max_incoming_connections = 4;
         config.clock = std::move(peer_clock);
+        config.threading = threading;
         return config;
     }
 
     explicit Fixture(ClockSource peer_clock = ClockSource()) : Fixture(peer_config(std::move(peer_clock))) {}
-    explicit Fixture(rn::PeerConfig config)
+    explicit Fixture(rn::Threading threading) : Fixture(peer_config(ClockSource(), threading)) {}
+    explicit Fixture(rn::PeerConfig config) : app_driven(config.threading == rn::Threading::app_driven)
     {
         peer.start(config);
 
@@ -117,7 +128,10 @@ struct Fixture
                 return true;
             if (std::chrono::steady_clock::now() >= give_up)
                 return false;
-            std::this_thread::sleep_for(1ms);
+            if (app_driven && peer.running())
+                peer.update(1ms);
+            else
+                std::this_thread::sleep_for(1ms);
         }
     }
 
@@ -176,7 +190,9 @@ TEST_CASE("Peer: connection outcomes carry the RakPeer's GUID and address", "[in
 {
     const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
     INFO(name(direction));
-    Fixture f;
+    const rn::Threading threading = GENERATE(rn::Threading::background, rn::Threading::app_driven);
+    INFO(threading_name(threading));
+    Fixture f(threading);
     f.establish(direction);
 
     const rn::Packet& packet = f.peer_last(direction == Direction::peer_connects ? rn::id::connection_request_accepted
@@ -196,7 +212,9 @@ TEST_CASE("BitStream: a mixed message is understood by RakNet's BitStream in bot
 {
     const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
     INFO(name(direction));
-    Fixture f;
+    const rn::Threading threading = GENERATE(rn::Threading::background, rn::Threading::app_driven);
+    INFO(threading_name(threading));
+    Fixture f(threading);
     f.establish(direction);
 
     // pzyNet -> RakNet
@@ -374,7 +392,9 @@ TEST_CASE("Peer: a RakPeer's close arrives as a disconnection notification", "[i
 {
     const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
     INFO(name(direction));
-    Fixture f;
+    const rn::Threading threading = GENERATE(rn::Threading::background, rn::Threading::app_driven);
+    INFO(threading_name(threading));
+    Fixture f(threading);
     f.establish(direction);
 
     f.rak->CloseConnection(f.peer_address, true);
@@ -387,7 +407,9 @@ TEST_CASE("Peer: closing locally notifies the RakPeer and produces no Packet", "
 {
     const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
     INFO(name(direction));
-    Fixture f;
+    const rn::Threading threading = GENERATE(rn::Threading::background, rn::Threading::app_driven);
+    INFO(threading_name(threading));
+    Fixture f(threading);
     f.establish(direction);
     const std::size_t before = f.peer_packets.size();
 
@@ -399,7 +421,9 @@ TEST_CASE("Peer: closing locally notifies the RakPeer and produces no Packet", "
 
 TEST_CASE("Peer: after shutdown the RakPeer gets no notification and the port is free", "[interop][rakpeer]")
 {
-    Fixture f;
+    const rn::Threading threading = GENERATE(rn::Threading::background, rn::Threading::app_driven);
+    INFO(threading_name(threading));
+    Fixture f(threading);
     f.establish(Direction::peer_connects);
     const std::uint16_t port = f.peer.local_endpoint().port();
 

@@ -58,9 +58,13 @@ if(PZYNET_RAKNET_INTEROP_DIR)
         interop/bit_stream_interop_test.cpp
         interop/bit_stream_geometry_interop_test.cpp
         interop/bit_stream_compressed_interop_test.cpp
-        interop/bit_stream_raknet_types_interop_test.cpp)
+        interop/bit_stream_raknet_types_interop_test.cpp
+        timer_resolution.cpp)
     target_link_libraries(pzynet_interop_tests PRIVATE
         pzynet::transport pzynet::raknet pzynet::rakpeer RakNetStatic Catch2::Catch2WithMain)
+    if(WIN32)
+        target_link_libraries(pzynet_interop_tests PRIVATE winmm)
+    endif()
     target_include_directories(pzynet_interop_tests SYSTEM PRIVATE "${PZYNET_RAKNET_INTEROP_DIR}/Source")
     target_compile_features(pzynet_interop_tests PRIVATE cxx_std_17)
     catch_discover_tests(pzynet_interop_tests PROPERTIES TIMEOUT 180)
