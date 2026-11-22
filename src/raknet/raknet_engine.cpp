@@ -74,25 +74,6 @@ std::uint64_t random_guid()
     return value;
 }
 
-/// Ids this layer interprets itself; an application payload must not start with one of them.
-bool is_reserved(std::uint8_t message_id) noexcept
-{
-    switch (message_id)
-    {
-    case id::connected_ping:
-    case id::connected_pong:
-    case id::detect_lost_connections:
-    case id::connection_request:
-    case id::connection_request_accepted:
-    case id::new_incoming_connection:
-    case id::disconnection_notification:
-    case id::invalid_password:
-        return true;
-    default:
-        return false;
-    }
-}
-
 std::uint16_t clamp_mtu(std::size_t mtu) noexcept
 {
     return static_cast<std::uint16_t>(

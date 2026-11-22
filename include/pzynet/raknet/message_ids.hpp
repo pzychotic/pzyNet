@@ -47,5 +47,25 @@ constexpr std::uint8_t download_progress = 30;
 constexpr std::uint8_t user_packet_enum = 134;
 } // namespace id
 
+/// Whether the protocol reserves a message id for itself, so that applications may not send it: the
+/// connected keep-alive and handshake messages and the disconnection notification.
+constexpr bool is_reserved(std::uint8_t message_id) noexcept
+{
+    switch (message_id)
+    {
+    case id::connected_ping:
+    case id::connected_pong:
+    case id::detect_lost_connections:
+    case id::connection_request:
+    case id::connection_request_accepted:
+    case id::new_incoming_connection:
+    case id::disconnection_notification:
+    case id::invalid_password:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace raknet
 } // namespace pzynet
