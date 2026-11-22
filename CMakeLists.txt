@@ -67,6 +67,7 @@ target_link_libraries(pzynet_transport PUBLIC pzynet::core pzynet::socket Thread
 # Needs only the *headers* of the transport layer (the Engine interface); it never touches a socket.
 pzynet_add_library(raknet STATIC
     src/raknet/bit_stream.cpp
+    src/raknet/bit_stream_types.cpp
     src/raknet/wire.cpp
     src/raknet/session.cpp
     src/raknet/raknet_engine.cpp)
