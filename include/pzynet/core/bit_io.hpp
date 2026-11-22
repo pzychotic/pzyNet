@@ -74,6 +74,16 @@ public:
         return v;
     }
     void align() noexcept { pos_ = (pos_ + 7) & ~std::size_t{7}; }
+    /// Moves past `count` bits; skipping beyond the end stops at the end and fails.
+    void skip(std::size_t count) noexcept
+    {
+        if (count > bits_remaining())
+        {
+            ok_ = false;
+            count = bits_remaining();
+        }
+        pos_ += count;
+    }
 
 private:
     ByteView data_;

@@ -413,10 +413,12 @@ void RakNetEngine::Impl::handle_offline(std::uint8_t message_id, const Endpoint&
     case id::connection_banned:
         fail(*connection, ConnectFailure::banned);
         return;
+    case id::no_free_incoming_connections:
+        fail(*connection, ConnectFailure::no_free_slots);
+        return;
     case id::ip_recently_connected:
         fail(*connection, ConnectFailure::recently_connected);
         return;
-    case id::no_free_incoming_connections:
     case id::connection_attempt_failed:
         fail(*connection, ConnectFailure::connection_refused);
         return;
@@ -918,6 +920,24 @@ std::uint64_t RakNetEngine::guid() const noexcept
 std::size_t RakNetEngine::connection_count() const noexcept
 {
     return impl_->by_id.size();
+}
+
+std::vector<ConnectionId> RakNetEngine::connections() const
+{
+    std::vector<ConnectionId> ids;
+    ids.reserve(impl_->by_id.size());
+    for (const auto& entry : impl_->by_id)
+        ids.push_back(entry.first);
+    return ids;
+}
+
+std::size_t RakNetEngine::closing_count() const noexcept
+{
+    std::size_t count = 0;
+    for (const auto& entry : impl_->by_endpoint)
+        if (entry.second->state == State::closing)
+            ++count;
+    return count;
 }
 
 std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) const

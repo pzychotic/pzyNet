@@ -91,7 +91,7 @@ class Peer
 {
 public:
     Peer() noexcept;
-    /// Shuts down as shutdown() does.
+    /// Shuts down as shutdown() with zero linger does.
     ~Peer();
     Peer(const Peer&) = delete;
     Peer& operator=(const Peer&) = delete;
@@ -105,9 +105,16 @@ public:
         detail::throw_if(ec, "Peer::start");
     }
 
-    /// Stops the network thread and closes the socket at once: connections are dropped without
-    /// notifying the remote systems, and pending Packets are discarded. No-op if not running.
-    void shutdown() noexcept;
+    /// Stops the Peer: stops the network thread, closes the socket and discards pending Packets.
+    /// No-op if not running.
+    ///
+    /// With a positive linger, first closes every connection gracefully, as disconnect() does, and
+    /// keeps the network running (in either threading mode) until every remote system has acknowledged
+    /// the data queued before and its disconnection notification, but never longer than linger.
+    /// No new connections are accepted meanwhile, and nothing more is reported through receive().
+    /// With zero linger, connections are dropped at once without notifying the remote systems, which
+    /// see them as lost after their time-out.
+    void shutdown(std::chrono::milliseconds linger = std::chrono::milliseconds(0)) noexcept;
 
     bool running() const noexcept { return impl_ != nullptr; }
 
@@ -128,6 +135,15 @@ public:
     {
         std::error_code ec;
         connect(to, password, ec);
+        detail::throw_if(ec, "Peer::connect");
+    }
+    /// Connects by host name (or address literal), resolved synchronously to its first IPv4 address.
+    /// A name that does not resolve fails the call with Errc::host_not_found; no Packet follows.
+    void connect(std::string_view host, std::uint16_t port, ByteView password, std::error_code& ec);
+    void connect(std::string_view host, std::uint16_t port, ByteView password = ByteView())
+    {
+        std::error_code ec;
+        connect(host, port, password, ec);
         detail::throw_if(ec, "Peer::connect");
     }
 

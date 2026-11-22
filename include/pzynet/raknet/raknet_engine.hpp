@@ -129,6 +129,11 @@ public:
     std::optional<ConnectionInfo> connection_info(transport::ConnectionId connection) const;
     /// nullopt for a connection the application cannot see (unknown, closed or failed).
     std::optional<ConnectionStats> connection_stats(transport::ConnectionId connection) const;
+    /// Every connection visible to the application (connected or still connecting), in no particular order.
+    std::vector<transport::ConnectionId> connections() const;
+    /// Connections closed gracefully that are still getting their last data out; each goes once the
+    /// remote has acknowledged everything, or after the time-out.
+    std::size_t closing_count() const noexcept;
 
     void set_max_incoming_connections(std::size_t count);
     void set_incoming_password(ByteView password);

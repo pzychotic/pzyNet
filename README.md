@@ -107,7 +107,8 @@ Payloads must not start with an id the protocol consumes itself; `send()` reject
 
 `raknet::BitStreamWriter` and `raknet::BitStreamReader` read and write RakNet's BitStream format bit for
 bit: values are packed most significant bit first with no regard for byte boundaries, a `bool` takes one
-bit, and integers of every width are written in the stream's byte order. That is big-endian by default,
+bit, and integers and enums of every width, `float` and `double` are written in the stream's byte order.
+That is big-endian by default,
 as in stock RakNet; pass `raknet::ByteOrder::little_endian` to talk to a RakNet build with
 `__BITSTREAM_NATIVE_END`.
 
@@ -128,6 +129,23 @@ if (!in.ok()) { /* the message was too short */ }
 
 The writer owns its buffer (`data()`, `bit_count()`); the reader is a non-owning view. A read past the
 end returns zero and latches `ok() == false`, so a message can be read in full and checked once.
+
+Beyond scalars: `write_bits()` / `read_bits()` take raw bits (with RakNet's right-aligned tail by default),
+`write_bytes()` and `write_aligned_bytes()` raw bytes, `align()` pads to a byte boundary, and the reader
+can `skip_bits()` / `skip_bytes()`. Your own types go through the stream once you declare free functions
+next to them, found by argument-dependent lookup:
+
+```cpp
+namespace game
+{
+struct Position { std::int16_t x; float y; };
+void write(raknet::BitStreamWriter& out, const Position& p) { out.write(p.x); out.write(p.y); }
+void read(raknet::BitStreamReader& in, Position& p) { in.read(p.x); in.read(p.y); }
+}
+
+out.write(game::Position{3, 1.5f});
+game::Position p = in.read<game::Position>(); // or: in.read(p) returns ok()
+```
 
 ## Peer
 
@@ -168,7 +186,10 @@ for (;;) {
   RakNet's failure ids (`connection_attempt_failed`, `no_free_incoming_connections`, `invalid_password`,
   `connection_banned`, `incompatible_protocol_version`, `already_connected`, `ip_recently_connected`,
   `remote_system_requires_public_key`). An accepted connection on the other side is
-  `id::new_incoming_connection`.
+  `id::new_incoming_connection`. `PeerConfig::engine.incoming_password` sets the password incoming
+  connections must present.
+- `connect(host, port, password)` takes a host name instead, resolved synchronously to its first IPv4
+  address; a name that does not resolve fails the call (`Errc::host_not_found`) and produces no Packet.
 - Remote systems are named by `raknet::Guid` or by `Endpoint`. `send()` takes a `BitStreamWriter` or raw
   bytes starting with the message id, with a reliability, channel and priority, and returns the send's
   receipt number. Addressing a system that is not connected fails with `Errc::not_connected`.
@@ -191,8 +212,10 @@ for (;;) {
 - `set_timeout(remote, ms)` overrides the time-out for one connection, `set_timeout(ms)` sets it for all
   (RakNet's `SetTimeoutTime`). `external_address(remote)` is this Peer's address as that remote system
   reported it during the handshake (RakNet's `GetExternalID`).
-- `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
-  anyone.
+- `shutdown(linger)` with a positive linger closes every connection gracefully and waits, at most
+  that long, until the remote systems have acknowledged the pending reliable data and their
+  disconnection notification (in either threading mode). `shutdown()` with zero linger, and the
+  destructor, stop at once without notifying anyone; the remotes see a lost connection.
 - Timestamped messages work as in RakPeer: send `id::timestamp`, `peer.time()` (8 bytes) and then the
   real message id. On receipt the time is converted into the receiver's clock using the connection's
   measured clock offset; it is rewritten in the data and available as `packet->timestamp`, and

@@ -52,7 +52,8 @@ enum class ConnectFailure
 {
     no_response,
     incompatible_protocol,
-    connection_refused, ///< peer has no free slot or does not accept connections
+    connection_refused, ///< peer refused without naming a more specific reason
+    no_free_slots,      ///< peer has no free slot or does not accept connections
     recently_connected, ///< peer refuses this address because it connected too recently
     already_connected,
     banned,

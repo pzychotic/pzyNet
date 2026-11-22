@@ -2,12 +2,14 @@
 
 #include "pzynet/raknet/message_ids.hpp"
 #include "pzynet/raknet/wire.hpp"
+#include "pzynet/socket/resolver.hpp"
 #include "pzynet/transport/udp_host.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace pzynet
@@ -29,12 +31,13 @@ std::uint8_t failure_id(transport::ConnectFailure reason) noexcept
     {
     case ConnectFailure::no_response: return id::connection_attempt_failed;
     case ConnectFailure::incompatible_protocol: return id::incompatible_protocol_version;
-    case ConnectFailure::connection_refused: return id::no_free_incoming_connections;
+    case ConnectFailure::connection_refused: return id::connection_attempt_failed;
+    case ConnectFailure::no_free_slots: return id::no_free_incoming_connections;
+    case ConnectFailure::recently_connected: return id::ip_recently_connected;
     case ConnectFailure::already_connected: return id::already_connected;
     case ConnectFailure::banned: return id::connection_banned;
     case ConnectFailure::invalid_credentials: return id::invalid_password;
     case ConnectFailure::unsupported: return id::remote_system_requires_public_key;
-    case ConnectFailure::recently_connected: return id::ip_recently_connected;
     }
     return id::connection_attempt_failed;
 }
@@ -174,7 +177,12 @@ struct Peer::Impl
                                remote);
         }
         if (const auto* failed = std::get_if<transport::ConnectFailed>(&event))
-            return make_packet(failure_id(failed->reason), Entry{Guid{}, failed->remote});
+        {
+            Packet packet = make_packet(failure_id(failed->reason), Entry{Guid{}, failed->remote});
+            if (packet.id == id::remote_system_requires_public_key)
+                packet.data.push_back(0); // RakPeer reports this one as [id][0]
+            return packet;
+        }
         if (const auto* disconnected = std::get_if<transport::Disconnected>(&event))
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -265,6 +273,48 @@ struct Peer::Impl
         }
         return std::nullopt;
     }
+
+    /// Closes every connection gracefully and runs the network until all of them have got their last
+    /// data out, or until linger has passed. Events are discarded.
+    void linger_and_close(std::chrono::milliseconds linger)
+    {
+        using SteadyClock = std::chrono::steady_clock;
+        const SteadyClock::time_point give_up = SteadyClock::now() + linger;
+        host.with_engine([this](transport::Engine&) {
+            engine.set_max_incoming_connections(0);
+            for (const transport::ConnectionId connection : engine.connections())
+                engine.disconnect(connection, transport::DisconnectMode::graceful);
+        });
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connections.clear();
+        }
+        const bool threaded = host.threaded();
+        for (;;)
+        {
+            transport::Event event;
+            while (host.poll_event(event))
+            {
+            }
+            if (host.with_engine([this](transport::Engine&) { return engine.closing_count(); }) == 0)
+                return;
+            const SteadyClock::time_point now = SteadyClock::now();
+            if (now >= give_up)
+                return;
+            // Short steps: in threaded mode only polling notices the end.
+            const auto step = std::min<std::chrono::milliseconds>(
+                std::chrono::ceil<std::chrono::milliseconds>(give_up - now), std::chrono::milliseconds(5));
+            if (threaded)
+                std::this_thread::sleep_for(step);
+            else
+            {
+                std::error_code ec;
+                host.update(step, ec);
+                if (ec)
+                    return;
+            }
+        }
+    }
 };
 
 Peer::Peer() noexcept = default;
@@ -292,8 +342,21 @@ void Peer::start(PeerConfig config, std::error_code& ec)
         impl_ = std::move(impl);
 }
 
-void Peer::shutdown() noexcept
+void Peer::shutdown(std::chrono::milliseconds linger) noexcept
 {
+    if (!impl_)
+        return;
+    if (linger > std::chrono::milliseconds(0))
+    {
+        try
+        {
+            impl_->linger_and_close(linger);
+        }
+        catch (...)
+        {
+            // dropping is all that is left
+        }
+    }
     impl_.reset(); // the host stops its thread and closes the socket; the engine goes silently
 }
 
@@ -323,6 +386,25 @@ void Peer::connect(const Endpoint& to, ByteView password, std::error_code& ec)
         return;
     }
     impl_->host.connect(to, password, ec);
+}
+
+void Peer::connect(std::string_view host, std::uint16_t port, ByteView password, std::error_code& ec)
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return;
+    }
+    const std::vector<Endpoint> endpoints = resolve(host, port, ResolveFamily::v4, ec);
+    if (ec)
+        return;
+    if (endpoints.empty())
+    {
+        ec = make_error_code(Errc::host_not_found);
+        return;
+    }
+    connect(endpoints.front(), password, ec);
 }
 
 void Peer::disconnect(const Remote& remote, transport::DisconnectMode mode, std::error_code& ec)
