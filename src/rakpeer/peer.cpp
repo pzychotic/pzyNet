@@ -91,6 +91,9 @@ struct Peer::Impl
     std::map<transport::ConnectionId, Entry> connections;
     std::uint32_t next_receipt = 1;
 
+    /// The time as the engine sees it.
+    TimePoint clock_now() const { return config.clock ? config.clock() : Clock::now(); }
+
     /// The next receipt number; 0 is skipped, as in RakPeer. Requires `mutex`.
     std::uint32_t take_receipt() noexcept
     {
@@ -139,7 +142,7 @@ struct Peer::Impl
         return packet;
     }
 
-    std::uint64_t now() const { return RakNetEngine::wire_time(config.clock ? config.clock() : Clock::now()); }
+    std::uint64_t now() const { return RakNetEngine::wire_time(clock_now()); }
 
     /// Shifts a timestamped message's time from the sender's clock into ours, in place, as RakPeer's
     /// ShiftIncomingTimestamp does (unsigned wrap-around; no measured offset means no shift).
@@ -446,6 +449,46 @@ std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& opt
     }
     impl_->host.send(connection, data, transport_options(options, receipt), ec);
     return ec ? 0 : receipt;
+}
+
+void Peer::ban(std::string_view address, std::chrono::milliseconds duration, std::error_code& ec)
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return;
+    }
+    const bool added = impl_->host.with_engine(
+        [&](transport::Engine&) { return impl_->engine.ban(address, duration, impl_->clock_now()); });
+    if (!added)
+        ec = make_error_code(Errc::invalid_argument);
+}
+
+void Peer::unban(std::string_view address)
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.unban(address); });
+}
+
+void Peer::clear_bans()
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.clear_bans(); });
+}
+
+bool Peer::is_banned(std::string_view address) const
+{
+    if (!impl_)
+        return false;
+    return impl_->host.with_engine(
+        [&](transport::Engine&) { return impl_->engine.is_banned(address, impl_->clock_now()); });
+}
+
+void Peer::set_limit_ip_connection_frequency(bool limit)
+{
+    if (impl_)
+        impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_limit_ip_connection_frequency(limit); });
 }
 
 ConnectionStats Peer::statistics(const Remote& remote, std::error_code& ec) const

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace pzynet
@@ -27,6 +28,10 @@ struct Config
     std::size_t max_incoming_connections = 0;
     /// Peers must present exactly these bytes to connect. Empty = no password.
     std::vector<std::uint8_t> incoming_password;
+    /// Refuse a connection attempt with id::ip_recently_connected when a connection from the same IP
+    /// (any port) was set up less than 100 ms before, as RakNet's SetLimitIPConnectionFrequency does.
+    /// This engine's own external IP, once a handshake reported it, is exempt.
+    bool limit_ip_connection_frequency = false;
 
     /// A connection is dropped when reliable data stays unacknowledged this long.
     std::chrono::milliseconds timeout{10000};
@@ -133,6 +138,22 @@ public:
     void set_max_incoming_connections(std::size_t count);
     void set_incoming_password(ByteView password);
     void set_offline_ping_response(ByteView data);
+
+    /// Bans an IPv4 address, as RakNet's ban list does: every datagram from a matching address is
+    /// dropped and answered with id::connection_banned. `address` is dotted (at most 15 characters);
+    /// a '*' matches the rest of the address ("10.0.*"). A zero `duration` bans permanently,
+    /// otherwise the ban ends `duration` after `now`. Banning an address again replaces its duration.
+    /// Existing connections from a banned address are not closed; their traffic is dropped, so they
+    /// time out. Returns false (and changes nothing) for an empty or too long `address`.
+    bool ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now);
+    /// Lifts the ban on exactly this entry (the same string that was banned).
+    void unban(std::string_view address);
+    void clear_bans();
+    /// True if `address` (dotted) matches an entry of the ban list that has not expired by `now`.
+    bool is_banned(std::string_view address, TimePoint now) const;
+
+    /// RakNet's SetLimitIPConnectionFrequency (see Config::limit_ip_connection_frequency).
+    void set_limit_ip_connection_frequency(bool limit);
 
     /// Sets the time-out of one connection, overriding Config::timeout (RakNet's SetTimeoutTime for
     /// one system). Errc::unknown_connection for an unknown id, Errc::invalid_argument unless positive.
