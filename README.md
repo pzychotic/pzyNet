@@ -181,8 +181,13 @@ for (;;) {
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
 - `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
   anyone.
-- `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out;
-  `PeerConfig::clock` replaces the steady clock the engine sees (useful in tests).
+- Timestamped messages work as in RakPeer: send `id::timestamp`, `peer.time()` (8 bytes) and then the
+  real message id. On receipt the time is converted into the receiver's clock using the connection's
+  measured clock offset; it is rewritten in the data and available as `packet->timestamp`, and
+  `packet->reader()` starts at the real message id. Other Packets have no timestamp.
+- `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out (and of the
+  timestamp in timestamped messages); `PeerConfig::clock` replaces the steady clock the engine and
+  `time()` see (useful in tests).
 
 [examples/rakpeer_chat.cpp](examples/rakpeer_chat.cpp) is the chat example rebuilt on the Peer and the
 BitStream; it talks to [examples/raknet_chat.cpp](examples/raknet_chat.cpp) and to RakNet applications
