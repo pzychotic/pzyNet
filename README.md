@@ -154,7 +154,9 @@ RakNet's own types are built in, with RakNet's encodings: `write(raknet::Guid)` 
 `write_uint24()` (byte-aligned, little-endian), `write_string()` (RakString: 16-bit length, then the
 bytes from the next byte boundary) and `write_wide_string()` (RakWString, which upstream also uses for
 its non-Huffman `WriteCompressed` of wide strings: 16-bit count, then 16-bit code units), each with its
-`read` counterpart.
+`read` counterpart. `write_huffman_string()` / `read_huffman_string()` are RakNet's compressed strings
+(`WriteCompressed(RakString)`): Huffman-coded with RakNet's StringCompressor and its English frequency
+table, after the code bit count as a compressed integer.
 
 RakNet's space-saving encodings have their own calls, each with a matching read: `write_compressed()`
 (integers without their zero bytes, floats and doubles in [-1, 1] as 16 and 32 bits), `write_delta()` and
