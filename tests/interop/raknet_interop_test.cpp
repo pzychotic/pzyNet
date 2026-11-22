@@ -440,7 +440,7 @@ TEST_CASE("a full server refuses in a way the other side understands", "[interop
         f.start_raknet(0);
         f.host.connect(f.raknet_endpoint());
         REQUIRE(f.pump_until([&] { return f.count<ConnectFailed>() == 1; }));
-        CHECK(f.all<ConnectFailed>()[0].reason == ConnectFailure::connection_refused);
+        CHECK(f.all<ConnectFailed>()[0].reason == ConnectFailure::no_free_slots);
     }
     SECTION("pzyNet server without free slots")
     {

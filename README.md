@@ -184,9 +184,12 @@ for (;;) {
 
 - `connect(endpoint, password)` reports its outcome as `id::connection_request_accepted` or one of
   RakNet's failure ids (`connection_attempt_failed`, `no_free_incoming_connections`, `invalid_password`,
-  `connection_banned`, `incompatible_protocol_version`, `already_connected`,
+  `connection_banned`, `incompatible_protocol_version`, `already_connected`, `ip_recently_connected`,
   `remote_system_requires_public_key`). An accepted connection on the other side is
-  `id::new_incoming_connection`.
+  `id::new_incoming_connection`. `PeerConfig::engine.incoming_password` sets the password incoming
+  connections must present.
+- `connect(host, port, password)` takes a host name instead, resolved synchronously to its first IPv4
+  address; a name that does not resolve fails the call (`Errc::host_not_found`) and produces no Packet.
 - Remote systems are named by `raknet::Guid` or by `Endpoint`. `send()` takes a `BitStreamWriter` or raw
   bytes starting with the message id, with a reliability, channel and priority, and returns the send's
   receipt number. Addressing a system that is not connected fails with `Errc::not_connected`.

@@ -342,7 +342,11 @@ void RakNetEngine::Impl::handle_offline(std::uint8_t message_id, const Endpoint&
         fail(*connection, ConnectFailure::banned);
         return;
     case id::no_free_incoming_connections:
+        fail(*connection, ConnectFailure::no_free_slots);
+        return;
     case id::ip_recently_connected:
+        fail(*connection, ConnectFailure::recently_connected);
+        return;
     case id::connection_attempt_failed:
         fail(*connection, ConnectFailure::connection_refused);
         return;
