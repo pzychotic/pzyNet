@@ -57,8 +57,7 @@ if(PZYNET_RAKNET_INTEROP_DIR)
     # writes the host's byte order (little-endian here). The define changes code inside RakNet's .cpp
     # files, so those are compiled into this executable directly instead of linking RakNetStatic, which
     # would mix both variants in one program.
-    add_executable(pzynet_interop_native_end_tests
-        interop/bit_stream_interop_test.cpp
+    set(raknet_bitstream_sources
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/BitStream.cpp"
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/StringCompressor.cpp"
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/HuffmanEncodingTree.cpp"
@@ -66,6 +65,11 @@ if(PZYNET_RAKNET_INTEROP_DIR)
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/RakNetTypes.cpp"
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/SuperFastHash.cpp"
         "${PZYNET_RAKNET_INTEROP_DIR}/Source/WSAStartupSingleton.cpp")
+    # RakNet's own code, not ours: keep its warnings out of the build log.
+    set_source_files_properties(${raknet_bitstream_sources} PROPERTIES COMPILE_OPTIONS $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
+    add_executable(pzynet_interop_native_end_tests
+        interop/bit_stream_interop_test.cpp
+        ${raknet_bitstream_sources})
     target_link_libraries(pzynet_interop_native_end_tests PRIVATE pzynet::raknet Catch2::Catch2WithMain)
     target_include_directories(pzynet_interop_native_end_tests SYSTEM PRIVATE "${PZYNET_RAKNET_INTEROP_DIR}/Source")
     target_compile_definitions(pzynet_interop_native_end_tests PRIVATE
