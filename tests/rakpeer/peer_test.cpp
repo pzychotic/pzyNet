@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -149,6 +150,7 @@ TEST_CASE("Peer: a BitStream message arrives as a Packet whose reader starts aft
     CHECK(packet->guid == client.guid());
     CHECK(packet->address == client.local_endpoint());
     CHECK(packet->data == std::vector<std::uint8_t>(message.data().begin(), message.data().end()));
+    CHECK_FALSE(packet->timestamp);
 
     BitStreamReader reader = packet->reader();
     CHECK(reader.read<bool>() == true);
@@ -332,4 +334,98 @@ TEST_CASE("Peer: a shut-down Peer can be started again", "[rakpeer]")
     std::error_code ec;
     peer.start(loopback_config(Threading::background), ec);
     CHECK(ec == Errc::already_open);
+}
+
+namespace
+{
+
+/// Signed difference of two RakNet times (which wrap around like RakNet's unsigned arithmetic).
+std::int64_t time_difference(std::uint64_t a, std::uint64_t b)
+{
+    return static_cast<std::int64_t>(a - b);
+}
+
+/// The big-endian 8-byte time in a timestamped message's header.
+std::uint64_t header_time(const std::vector<std::uint8_t>& data)
+{
+    std::uint64_t value = 0;
+    for (std::size_t i = 1; i < 9; ++i)
+        value = (value << 8) | data[i];
+    return value;
+}
+
+} // namespace
+
+TEST_CASE("Peer: a timestamped message arrives converted into the receiver's clock", "[rakpeer]")
+{
+    // One side's clock runs an hour ahead, so an unconverted time would be an hour off.
+    const bool skew_sender = GENERATE(true, false);
+    INFO((skew_sender ? "sender's clock is ahead" : "receiver's clock is ahead"));
+    const ClockSource ahead = [] { return Clock::now() + 1h; };
+
+    PeerConfig server_config = loopback_config(4);
+    PeerConfig client_config = loopback_config();
+    (skew_sender ? client_config : server_config).clock = ahead;
+    Peer server;
+    server.start(server_config);
+    Peer client;
+    client.start(client_config);
+    client.connect(server.local_endpoint());
+    REQUIRE(wait_for_packet(client));
+    REQUIRE(wait_for_packet(server));
+
+    const std::int64_t skew = time_difference(client.time(), server.time());
+    CHECK(std::abs(skew - (skew_sender ? 3'600'000 : -3'600'000)) <= 50);
+
+    const std::uint64_t sent_at = client.time();
+    BitStreamWriter message;
+    message.write(id::timestamp);
+    message.write(sent_at);
+    message.write(id::user_packet_enum);
+    message.write(std::uint32_t{0xC0FFEE});
+    client.send(server.guid(), message);
+
+    const std::optional<Packet> packet = wait_for_packet(server);
+    REQUIRE(packet);
+    const std::uint64_t received_at = server.time();
+    REQUIRE(packet->timestamp);
+    // Sent moments ago in the receiver's clock: within the clock offset's error of loopback round trips.
+    CHECK(time_difference(received_at, *packet->timestamp) >= -20);
+    CHECK(time_difference(received_at, *packet->timestamp) <= 100);
+
+    CHECK(packet->id == id::timestamp);
+    CHECK(packet->guid == client.guid());
+    REQUIRE(packet->data.size() == 14);
+    CHECK(header_time(packet->data) == *packet->timestamp);
+    CHECK(std::vector<std::uint8_t>(packet->data.begin() + 9, packet->data.end()) ==
+          std::vector<std::uint8_t>{id::user_packet_enum, 0x00, 0xC0, 0xFF, 0xEE});
+
+    BitStreamReader reader = packet->reader();
+    CHECK(reader.read<std::uint8_t>() == id::user_packet_enum);
+    CHECK(reader.read<std::uint32_t>() == 0xC0FFEE);
+    CHECK(reader.ok());
+}
+
+TEST_CASE("Peer: a timestamped message with a truncated header is delivered unmodified", "[rakpeer]")
+{
+    PeerConfig client_config = loopback_config();
+    client_config.clock = [] { return Clock::now() + 1h; }; // any conversion would change the bytes
+    Peer server;
+    server.start(loopback_config(4));
+    Peer client;
+    client.start(client_config);
+    client.connect(server.local_endpoint());
+    REQUIRE(wait_for_packet(client));
+    REQUIRE(wait_for_packet(server));
+
+    const std::vector<std::uint8_t> truncated{id::timestamp, 1, 2, 3, 4, 5, 6, 7};
+    client.send(server.guid(), truncated);
+
+    const std::optional<Packet> packet = wait_for_packet(server);
+    REQUIRE(packet);
+    CHECK(packet->id == id::timestamp);
+    CHECK(packet->data == truncated);
+    CHECK_FALSE(packet->timestamp);
+    BitStreamReader reader = packet->reader();
+    CHECK(reader.read<std::uint8_t>() == 1);
 }

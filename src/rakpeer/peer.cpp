@@ -79,6 +79,27 @@ struct Peer::Impl
         return packet;
     }
 
+    std::uint64_t now() const { return RakNetEngine::wire_time(config.clock ? config.clock() : Clock::now()); }
+
+    /// Shifts a timestamped message's time from the sender's clock into ours, in place, as RakPeer's
+    /// ShiftIncomingTimestamp does (unsigned wrap-around; no measured offset means no shift).
+    void to_local_time(Packet& packet, transport::ConnectionId connection)
+    {
+        const std::optional<ConnectionInfo> info =
+            host.with_engine([&](transport::Engine&) { return engine.connection_info(connection); });
+        const std::uint64_t offset =
+            info && info->clock_offset ? static_cast<std::uint64_t>(info->clock_offset->count()) : 0;
+
+        const ByteView header = ByteView(packet.data.data(), packet.data.size()).subspan(1, 8);
+        BitStreamReader reader(header, config.byte_order);
+        const std::uint64_t local = reader.read<std::uint64_t>() - offset;
+
+        BitStreamWriter writer(config.byte_order);
+        writer.write(local);
+        std::copy(writer.data().begin(), writer.data().end(), packet.data.begin() + 1);
+        packet.timestamp = local;
+    }
+
     /// Turns a transport event into a Packet; nullopt for events RakNet does not report.
     std::optional<Packet> translate(transport::Event& event)
     {
@@ -122,6 +143,8 @@ struct Peer::Impl
             }
             Packet packet = make_packet(message->data[0], remote);
             packet.data = std::move(message->data);
+            if (packet.id == id::timestamp && packet.data.size() >= Packet::timestamp_header_size)
+                to_local_time(packet, message->connection);
             return packet;
         }
         return std::nullopt; // receipts and offline datagrams are not reported yet
@@ -223,6 +246,11 @@ Guid Peer::guid() const
 Endpoint Peer::local_endpoint() const
 {
     return impl_ ? impl_->host.local_endpoint() : Endpoint();
+}
+
+std::uint64_t Peer::time() const
+{
+    return impl_ ? impl_->now() : RakNetEngine::wire_time(Clock::now());
 }
 
 void Peer::connect(const Endpoint& to, ByteView password, std::error_code& ec)
