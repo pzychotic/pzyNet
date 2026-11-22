@@ -687,6 +687,81 @@ TEST_CASE("a silent peer is detected by time-out", "[raknet][engine]")
     CHECK(s.server.engine.connection_count() == 0);
 }
 
+TEST_CASE("a connection with a shorter time-out drops while others survive the same stall", "[raknet][engine]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& impatient = network.add();
+    Node& patient = network.add();
+    const auto short_lived = connect(network, impatient, server);
+    const auto long_lived = connect(network, patient, server);
+
+    std::error_code ec;
+    server.engine.set_timeout(short_lived.second, 2s, ec);
+    REQUIRE_FALSE(ec);
+    CHECK(server.engine.connection_info(short_lived.second)->timeout == 2s);
+    CHECK(server.engine.connection_info(long_lived.second)->timeout == 10s);
+
+    network.run(1s);
+    network.loss = 1.0; // every connection stalls
+    const TimePoint cut = network.now;
+    REQUIRE(network.run_until([&] { return server.count<Disconnected>() == 1; }, 20s));
+    CHECK(network.now - cut <= 4s); // within keep-alive interval (timeout/2) plus the timeout
+    CHECK(server.all<Disconnected>()[0].connection == short_lived.second);
+    CHECK(server.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+
+    // Long after the impatient connection gave up, the patient one rides out the stall.
+    network.run(4s);
+    network.loss = 0.0;
+    CHECK(server.count<Disconnected>() == 1);
+    send(patient, long_lived.first, user_message(1));
+    REQUIRE(network.run_until([&] { return server.count<Message>() == 1; }));
+    CHECK(server.all<Message>()[0].connection == long_lived.second);
+}
+
+TEST_CASE("the time-out can be changed for every connection at once", "[raknet][engine]")
+{
+    Session s;
+    s.server.engine.set_timeout(s.at_server, 30s);
+    s.server.engine.set_timeout(3s); // like RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS
+    CHECK(s.server.engine.connection_info(s.at_server)->timeout == 3s);
+
+    Node& late = s.network.add();
+    const auto ids = connect(s.network, late, s.server);
+    CHECK(s.server.engine.connection_info(ids.second)->timeout == 3s);
+}
+
+TEST_CASE("set_timeout rejects unknown connections and non-positive durations", "[raknet][engine]")
+{
+    Session s;
+    std::error_code ec;
+    s.server.engine.set_timeout(ConnectionId(9999), 1s, ec);
+    CHECK(ec == Errc::unknown_connection);
+    s.server.engine.set_timeout(s.at_server, 0ms, ec);
+    CHECK(ec == Errc::invalid_argument);
+    CHECK(s.server.engine.connection_info(s.at_server)->timeout == 10s);
+}
+
+TEST_CASE("each side learns its external address from the handshake", "[raknet][engine]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+
+    std::error_code ec;
+    const ConnectionId pending = client.engine.connect(server.address, {}, ec);
+    REQUIRE_FALSE(ec);
+    CHECK_FALSE(client.engine.connection_info(pending)->external_address);
+
+    REQUIRE(network.run_until([&] { return client.count<Connected>() == 1 && server.count<Connected>() == 1; }));
+    const auto client_info = client.engine.connection_info(pending);
+    const auto server_info = server.engine.connection_info(server.all<Connected>()[0].connection);
+    REQUIRE(client_info->external_address);
+    REQUIRE(server_info->external_address);
+    CHECK(*client_info->external_address == client.address);
+    CHECK(*server_info->external_address == server.address);
+}
+
 TEST_CASE("an abrupt disconnect leaves the peer to time out", "[raknet][engine]")
 {
     Session s;

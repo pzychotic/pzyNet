@@ -64,6 +64,14 @@ struct Receipt
     bool delivered = false;
 };
 
+struct SessionCounters
+{
+    std::uint64_t bytes_sent = 0;
+    std::uint64_t bytes_received = 0;
+    std::uint64_t datagrams_resent = 0;
+    std::uint64_t datagrams_lost = 0;
+};
+
 class Session
 {
 public:
@@ -94,8 +102,16 @@ public:
     bool acks_pending() const noexcept { return !acks_.empty(); }
     TimePoint last_reliable_send() const noexcept { return last_reliable_send_; }
     std::size_t mtu() const noexcept { return config_.mtu; }
+    Duration timeout() const noexcept { return config_.timeout; }
+    void set_timeout(Duration timeout) noexcept { config_.timeout = timeout; }
     /// Smoothed round-trip time, once at least one acknowledgement arrived.
     std::optional<Duration> rtt() const;
+
+    const SessionCounters& counters() const noexcept { return counters_; }
+    /// Messages in the send queue (a split message counts once, until its last piece leaves).
+    std::size_t queued_messages() const noexcept;
+    /// Payload bytes in the send queue.
+    std::size_t queued_bytes() const noexcept;
 
     /// Largest payload that fits in one datagram without splitting.
     std::size_t max_unsplit_payload() const noexcept;
@@ -128,6 +144,8 @@ private:
         std::vector<std::uint32_t> receipt_tokens; // of unreliable messages that asked for a receipt
         bool continuous = false;
         bool acked = false;
+        bool lost = false;    // presumed lost: NAKed, or its messages retransmitted on time-out
+        bool resends = false; // carries at least one retransmission
     };
 
     struct PendingReceipt
@@ -175,6 +193,7 @@ private:
     void flush_naks(std::vector<Bytes>& out);
     void expire_receipts(TimePoint now);
     void trim_history();
+    void presume_lost(SentDatagram& record);
     Duration rto() const;
     bool in_slow_start() const noexcept { return ss_thresh_ == 0.0 || cwnd_ <= ss_thresh_; }
 
@@ -247,6 +266,8 @@ private:
     std::deque<Delivered> delivered_;
     bool timed_out_ = false;
     bool violated_ = false;
+
+    SessionCounters counters_;
 };
 
 } // namespace detail

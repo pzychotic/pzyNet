@@ -133,6 +133,26 @@ Duration Session::rto() const
     return std::chrono::duration_cast<Duration>(std::chrono::duration<double, std::micro>(us));
 }
 
+std::size_t Session::queued_messages() const noexcept
+{
+    std::size_t count = 0;
+    for (const auto& entry : queue_)
+    {
+        const wire::MessageHeader& header = entry.second.header;
+        if (!header.split || header.split_index + 1 == header.split_count)
+            ++count;
+    }
+    return count;
+}
+
+std::size_t Session::queued_bytes() const noexcept
+{
+    std::size_t bytes = 0;
+    for (const auto& entry : queue_)
+        bytes += entry.second.length;
+    return bytes;
+}
+
 bool Session::poll_delivered(Delivered& out)
 {
     if (delivered_.empty())
@@ -293,6 +313,8 @@ void Session::close_datagram(std::vector<Bytes>& out)
     if (!building_open_)
         return;
     building_open_ = false;
+    if (building_record_.resends)
+        ++counters_.datagrams_resent;
     history_.push_back(std::move(building_record_));
     ++next_datagram_;
     ++datagrams_this_advance_;
@@ -310,6 +332,14 @@ void Session::trim_history()
         history_.pop_front();
         ++history_base_;
     }
+}
+
+void Session::presume_lost(SentDatagram& record)
+{
+    if (record.acked || record.lost)
+        return;
+    record.lost = true;
+    ++counters_.datagrams_lost;
 }
 
 void Session::flush_acks(std::vector<Bytes>& out)
@@ -369,6 +399,7 @@ void Session::advance(TimePoint now, std::vector<Bytes>& out)
         return;
     }
 
+    const std::size_t first_output = out.size();
     expire_receipts(now);
     for (auto it = assemblies_.begin(); it != assemblies_.end();)
     {
@@ -397,9 +428,15 @@ void Session::advance(TimePoint now, std::vector<Bytes>& out)
         const std::uint32_t number = resend_schedule_.begin()->second;
         resend_schedule_.erase(resend_schedule_.begin());
         OutMessage& message = unacked_.at(number);
-        timed_out_resend = timed_out_resend || !message.resend_requested;
+        if (!message.resend_requested)
+        {
+            timed_out_resend = true;
+            if (message.last_datagram >= history_base_ && message.last_datagram < history_base_ + history_.size())
+                presume_lost(history_[static_cast<std::size_t>(message.last_datagram - history_base_)]);
+        }
         message.resend_requested = false;
         append_message(message, now, out);
+        building_record_.resends = true;
         message.last_datagram = next_datagram_;
         message.schedule = resend_schedule_.emplace(now + rto(), number);
     }
@@ -450,6 +487,9 @@ void Session::advance(TimePoint now, std::vector<Bytes>& out)
     }
     close_datagram(out);
     continuous_ = !queue_.empty();
+
+    for (std::size_t i = first_output; i < out.size(); ++i)
+        counters_.bytes_sent += out[i].size();
 }
 
 std::optional<TimePoint> Session::next_deadline() const
@@ -564,6 +604,7 @@ void Session::on_nak(std::uint64_t number, SentDatagram& record, TimePoint now)
 {
     if (record.acked)
         return;
+    presume_lost(record);
     for (std::uint32_t reliable_number : record.reliable_numbers)
     {
         const auto it = unacked_.find(reliable_number);
@@ -590,6 +631,7 @@ void Session::handle_datagram(ByteView datagram, TimePoint now)
     if (!wire::read_datagram_header(in, header))
         return;
     last_received_ = now;
+    counters_.bytes_received += datagram.size();
 
     if (header.kind == wire::DatagramKind::data)
     {
