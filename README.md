@@ -7,11 +7,13 @@ A C++17 network library for Windows and Linux, in layers that can be used on the
 | `pzynet::core` | Byte views, byte/bit readers and writers, IP address and endpoint types, error helpers | — |
 | `pzynet::socket` | UDP and TCP sockets, readiness poller, DNS resolver | core |
 | `pzynet::transport` | Protocol-neutral connection interface (`Engine`) and a UDP driver (`UdpHost`) | core, socket |
-| `pzynet::raknet` | The RakNet 4.x wire protocol as a `transport::Engine` | core (+ transport headers) |
+| `pzynet::raknet` | The RakNet 4.x wire protocol as a `transport::Engine`, and RakNet's BitStream format | core (+ transport headers) |
+| `pzynet::rakpeer` | A RakNet-style `Peer`: socket, engine and network thread, with RakNet's application semantics | raknet, transport, socket |
 
-The RakNet layer speaks the wire protocol of stock RakNet 4.x (protocol version 6): a pzyNet peer can
-connect to, or accept connections from, an unmodified RakNet application. It implements none of RakNet's
-API and none of its plugins.
+The RakNet layer speaks the wire protocol of stock RakNet 4.x (protocol version 6): a pzyNet program can
+connect to, or accept connections from, an unmodified RakNet application. On top of it, the BitStream
+and the Peer give RakNet's application-level behaviour in pzyNet's own C++17 style; they reproduce what
+RakNet does, not its API names, and none of its plugins.
 
 ## Building
 
@@ -33,7 +35,7 @@ ctest --preset msvc-debug
 | `BUILD_SHARED_LIBS` | off | standard CMake switch |
 
 Consume it with `add_subdirectory`/`FetchContent`, or install it and use
-`find_package(pzynet COMPONENTS socket raknet)`, then link `pzynet::socket`, `pzynet::raknet`, …
+`find_package(pzynet COMPONENTS socket raknet rakpeer)`, then link `pzynet::socket`, `pzynet::rakpeer`, …
 
 ## Error handling
 
@@ -100,7 +102,87 @@ Messages are passed through untouched. When the other side is a RakNet applicati
 message id it understands (`raknet::id::user_packet_enum`, 134, is the first one free for applications).
 Payloads must not start with an id the protocol consumes itself; `send()` rejects those.
 
-### Compatibility and limits
+## BitStream
+
+`raknet::BitStreamWriter` and `raknet::BitStreamReader` read and write RakNet's BitStream format bit for
+bit: values are packed most significant bit first with no regard for byte boundaries, a `bool` takes one
+bit, and integers of every width are written in the stream's byte order. That is big-endian by default,
+as in stock RakNet; pass `raknet::ByteOrder::little_endian` to talk to a RakNet build with
+`__BITSTREAM_NATIVE_END`.
+
+```cpp
+#include "pzynet/raknet/bit_stream.hpp"
+
+raknet::BitStreamWriter out;
+out.write(std::uint8_t{raknet::id::user_packet_enum + 1}); // message id
+out.write(true);                                           // one bit
+out.write(std::int32_t{-42});                              // four bytes, not byte-aligned
+
+raknet::BitStreamReader in(out.data());
+in.read<std::uint8_t>();
+bool flag = in.read<bool>();
+std::int32_t value = in.read<std::int32_t>();
+if (!in.ok()) { /* the message was too short */ }
+```
+
+The writer owns its buffer (`data()`, `bit_count()`); the reader is a non-owning view. A read past the
+end returns zero and latches `ok() == false`, so a message can be read in full and checked once.
+
+## Peer
+
+`raknet::Peer` is a RakNet endpoint in a few lines: it owns the socket and the RakNet engine and runs the
+network on a background thread (or, with `Threading::app_driven`, whenever you call `update()`).
+Everything it has to report arrives through `receive()` as a `raknet::Packet`, named by its RakNet
+message id, so a program dispatches on the first byte as RakNet programs do.
+
+```cpp
+#include "pzynet/rakpeer/peer.hpp"
+
+using namespace pzynet;
+
+raknet::PeerConfig config;
+config.bind = {IpAddress::any_v4(), 60000};
+config.engine.max_incoming_connections = 32;   // the raknet::Config of the engine
+raknet::Peer peer;
+peer.start(config);
+
+for (;;) {
+    while (std::optional<raknet::Packet> packet = peer.receive()) {
+        switch (packet->id) {
+        case raknet::id::new_incoming_connection: /* packet->guid, packet->address */ break;
+        case raknet::id::disconnection_notification: break;
+        case raknet::id::user_packet_enum: {
+            raknet::BitStreamReader in = packet->reader(); // positioned after the message id
+            bool flag = in.read<bool>();
+            peer.send(packet->guid, packet->data);          // echo, reliable ordered by default
+            break;
+        }
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+```
+
+- `connect(endpoint, password)` reports its outcome as `id::connection_request_accepted` or one of
+  RakNet's failure ids (`connection_attempt_failed`, `no_free_incoming_connections`, `invalid_password`,
+  `connection_banned`, `incompatible_protocol_version`, `already_connected`,
+  `remote_system_requires_public_key`). An accepted connection on the other side is
+  `id::new_incoming_connection`.
+- Remote systems are named by `raknet::Guid` or by `Endpoint`. `send()` takes a `BitStreamWriter` or raw
+  bytes starting with the message id, with a reliability, channel and priority, and returns the send's
+  receipt number.
+- A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
+  `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
+- `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
+  anyone.
+- `PeerConfig::byte_order` sets the byte order of the readers that Packets hand out;
+  `PeerConfig::clock` replaces the steady clock the engine sees (useful in tests).
+
+[examples/rakpeer_chat.cpp](examples/rakpeer_chat.cpp) is the chat example rebuilt on the Peer and the
+BitStream; it talks to [examples/raknet_chat.cpp](examples/raknet_chat.cpp) and to RakNet applications
+that use the same layout.
+
+## Compatibility and limits
 
 - Interoperates with RakNet 4.x built with default settings: no `LIBCAT_SECURITY`, no
   `RAKNET_SUPPORT_IPV6`, 64-bit time, protocol version 6. A server that demands security is reported as
@@ -116,11 +198,12 @@ Payloads must not start with an id the protocol consumes itself; `send()` reject
 
 - `pzynet_tests`: unit tests for every layer. The RakNet engine is tested without sockets, through an
   in-memory network with a fake clock (loss, duplication, reordering, MTU limits, hostile input), and
-  its encoders against byte-exact vectors.
+  its encoders and the BitStream against byte-exact vectors. Peers are tested in pairs over loopback.
 - `pzynet_interop_tests` (built when `PZYNET_RAKNET_INTEROP_DIR` is set): real loopback sessions between
   pzyNet and a RakNet peer built from that checkout, in both directions — handshake, passwords, all
   reliabilities, ordering, split messages, bulk transfer, disconnects, time-outs, keep-alive, ping/pong,
-  advertise, and several RakNet clients against one pzyNet server.
+  advertise, and several RakNet clients against one pzyNet server. The Peer is checked against a
+  RakPeer, and BitStream messages against RakNet's own BitStream.
 
 ```bash
 cmake --preset msvc -DPZYNET_RAKNET_INTEROP_DIR=D:/path/to/RakNet
