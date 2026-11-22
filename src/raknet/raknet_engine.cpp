@@ -68,6 +68,8 @@ struct Connection
     // application messages, for ConnectionStats
     std::uint64_t messages_sent = 0;
     std::uint64_t messages_received = 0;
+    std::chrono::milliseconds timeout{0};
+    std::optional<Endpoint> external_address; // ours, as the remote reported it in the handshake
 };
 
 std::uint64_t random_guid()
@@ -226,6 +228,7 @@ struct RakNetEngine::Impl
         connection->remote = remote;
         connection->incoming = incoming;
         connection->created = now;
+        connection->timeout = config.timeout;
         Connection& reference = *connection;
         by_id[reference.id] = &reference;
         by_endpoint[remote] = std::move(connection);
@@ -245,7 +248,7 @@ struct RakNetEngine::Impl
     {
         detail::SessionConfig session_config;
         session_config.mtu = clamp_mtu(mtu);
-        session_config.timeout = config.timeout;
+        session_config.timeout = connection.timeout;
         session_config.max_message_size = config.max_message_size;
         connection.mtu = static_cast<std::uint16_t>(session_config.mtu);
         connection.session = std::make_unique<Session>(session_config, now);
@@ -274,7 +277,7 @@ struct RakNetEngine::Impl
     {
         by_id.erase(connection.id);
         connection.state = State::closing;
-        connection.close_deadline = now + config.timeout;
+        connection.close_deadline = now + connection.timeout;
     }
 
     void fail(Connection& connection, ConnectFailure reason, bool linger = false)
@@ -430,7 +433,7 @@ void RakNetEngine::Impl::handle_offline(std::uint8_t message_id, const Endpoint&
         fail(*connection, ConnectFailure::banned);
         return;
     case id::ip_recently_connected:
-        fail(*connection, ConnectFailure::ip_recently_connected);
+        fail(*connection, ConnectFailure::recently_connected);
         return;
     case id::no_free_incoming_connections:
     case id::connection_attempt_failed:
@@ -557,6 +560,7 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
             {
                 record_clock(connection, incoming.accept_time, incoming.time);
                 learn_external_address(incoming.server_address);
+                connection.external_address = incoming.server_address;
             }
             announce(connection);
         }
@@ -579,6 +583,7 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
                 return;
             record_clock(connection, accepted.request_time, accepted.accept_time);
             learn_external_address(accepted.client_address);
+            connection.external_address = accepted.client_address;
 
             wire::NewIncomingConnection reply;
             reply.server_address = connection.remote;
@@ -698,7 +703,7 @@ void RakNetEngine::Impl::advance_connection(Connection& connection)
     // Keep-alive: an idle connection gets a reliable ping, so that a dead peer shows up as
     // unacknowledged data and trips the session's time-out.
     if (connection.state == State::connected && !session.has_unacked() &&
-        now - session.last_reliable_send() >= config.timeout / 2)
+        now - session.last_reliable_send() >= connection.timeout / 2)
     {
         wire::ConnectedPing ping;
         ping.time = now_ms();
@@ -835,7 +840,7 @@ std::optional<TimePoint> RakNetEngine::next_deadline() const
         if (connection.state == State::connected)
         {
             if (!session.has_unacked())
-                consider(session.last_reliable_send() + impl.config.timeout / 2);
+                consider(session.last_reliable_send() + connection.timeout / 2);
         }
         else if (connection.state == State::closing)
             consider(session.flushed() && !session.acks_pending() ? TimePoint::min() : connection.close_deadline);
@@ -945,6 +950,8 @@ std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) con
     info.mtu = connection->mtu;
     info.incoming = connection->incoming;
     info.clock_offset = connection->clock_offset;
+    info.timeout = connection->timeout;
+    info.external_address = connection->external_address;
     if (connection->session)
         info.rtt = connection->session->rtt();
     return info;
@@ -969,6 +976,39 @@ std::optional<ConnectionStats> RakNetEngine::connection_stats(ConnectionId id) c
         stats.queued_bytes = session->queued_bytes();
     }
     return stats;
+}
+
+void RakNetEngine::set_timeout(ConnectionId id, std::chrono::milliseconds timeout, std::error_code& ec)
+{
+    if (timeout.count() <= 0)
+    {
+        ec = make_error_code(Errc::invalid_argument);
+        return;
+    }
+    Connection* connection = impl_->find(id);
+    if (connection == nullptr)
+    {
+        ec = make_error_code(Errc::unknown_connection);
+        return;
+    }
+    ec.clear();
+    connection->timeout = timeout;
+    if (connection->session)
+        connection->session->set_timeout(timeout);
+}
+
+void RakNetEngine::set_timeout(std::chrono::milliseconds timeout)
+{
+    if (timeout.count() <= 0)
+        return;
+    impl_->config.timeout = timeout;
+    for (auto& entry : impl_->by_endpoint)
+    {
+        Connection& connection = *entry.second;
+        connection.timeout = timeout;
+        if (connection.session)
+            connection.session->set_timeout(timeout);
+    }
 }
 
 void RakNetEngine::set_max_incoming_connections(std::size_t count)

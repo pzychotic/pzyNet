@@ -95,7 +95,8 @@ A client calls `host.connect(endpoint, password)` and waits for `Connected` or `
 `SendOptions` select reliability (the five RakNet reliabilities), ordering channel (0–31), priority and
 an optional receipt token (RakNet's `*_WITH_ACK_RECEIPT`). Unconnected ping/pong and "advertise system"
 are available through `RakNetEngine::ping()` / `advertise()`; RakNet-specific state (GUIDs, MTU,
-round-trip time, clock offset) through `connection_info()`. From another thread, reach the engine with
+round-trip time, clock offset, time-out, external address) through `connection_info()`; time-outs per
+connection or for all with `set_timeout()`. From another thread, reach the engine with
 `host.with_engine(...)`. [examples/raknet_chat.cpp](examples/raknet_chat.cpp) is a complete program.
 
 Messages are passed through untouched. When the other side is a RakNet application, start payloads with a
@@ -170,7 +171,13 @@ for (;;) {
   `id::new_incoming_connection`.
 - Remote systems are named by `raknet::Guid` or by `Endpoint`. `send()` takes a `BitStreamWriter` or raw
   bytes starting with the message id, with a reliability, channel and priority, and returns the send's
-  receipt number.
+  receipt number. Addressing a system that is not connected fails with `Errc::not_connected`.
+- `connections()` lists the connected systems with GUID, address, round-trip time, MTU and direction;
+  `guid_of(endpoint)` and `address_of(guid)` look one up.
+- Without a connection: `ping(endpoint, only_if_accepting)` yields an `id::unconnected_pong` Packet
+  (`[id][u32 ping time][response]`), answered with `set_offline_ping_response()`;
+  `advertise(endpoint, data)` arrives as `id::advertise_system`. `set_max_incoming_connections()` and
+  `set_incoming_password()` change those settings while running.
 - A remote close arrives as `id::disconnection_notification`, a time-out as `id::connection_lost`.
   `disconnect()` notifies the remote system but, as in RakNet, produces no Packet locally.
 - `ban(address, duration)` refuses an IPv4 address (`"192.168.*"` wildcards allowed; zero duration
@@ -181,6 +188,9 @@ for (;;) {
   sent and received, resent datagrams, datagrams presumed lost, and the send queue in messages and bytes
   (the engine offers the same through `RakNetEngine::connection_stats()`). It is a small diagnostic
   set, not RakNet's `RakNetStatistics`.
+- `set_timeout(remote, ms)` overrides the time-out for one connection, `set_timeout(ms)` sets it for all
+  (RakNet's `SetTimeoutTime`). `external_address(remote)` is this Peer's address as that remote system
+  reported it during the handshake (RakNet's `GetExternalID`).
 - `shutdown()`, and the destructor, stop the thread and close the socket at once, without notifying
   anyone.
 - Timestamped messages work as in RakPeer: send `id::timestamp`, `peer.time()` (8 bytes) and then the
