@@ -48,7 +48,7 @@ std::uint32_t index_of(const Bytes& message)
     return reader.u32_be();
 }
 
-void send(Peer& peer, ConnectionId connection, const Bytes& data,
+void send(Node& node, ConnectionId connection, const Bytes& data,
           Reliability reliability = Reliability::reliable_ordered, std::uint8_t channel = 0,
           std::uint32_t receipt_token = 0)
 {
@@ -57,12 +57,12 @@ void send(Peer& peer, ConnectionId connection, const Bytes& data,
     options.channel = channel;
     options.receipt_token = receipt_token;
     std::error_code ec;
-    peer.engine.send(connection, data, options, ec);
+    node.engine.send(connection, data, options, ec);
     REQUIRE_FALSE(ec);
 }
 
 /// Connects `client` to `server` and returns {client's id, server's id} for the new connection.
-std::pair<ConnectionId, ConnectionId> connect(Network& network, Peer& client, Peer& server, ByteView password = {})
+std::pair<ConnectionId, ConnectionId> connect(Network& network, Node& client, Node& server, ByteView password = {})
 {
     const std::size_t client_before = client.count<Connected>();
     const std::size_t server_before = server.count<Connected>();
@@ -83,8 +83,8 @@ std::pair<ConnectionId, ConnectionId> connect(Network& network, Peer& client, Pe
 struct Session
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     ConnectionId at_client = 0;
     ConnectionId at_server = 0;
 
@@ -103,8 +103,8 @@ struct Session
 TEST_CASE("two engines complete the RakNet handshake", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
 
     std::vector<Network::Datagram> wire;
     network.tap = [&](const Network::Datagram& datagram) { wire.push_back(datagram); };
@@ -182,7 +182,7 @@ TEST_CASE("the first user message is numbered like a stock RakNet client's", "[r
 TEST_CASE("a connection attempt to a silent address fails after the MTU ladder", "[raknet][engine]")
 {
     Network network;
-    Peer& client = network.add();
+    Node& client = network.add();
     std::map<std::size_t, int> probes; // datagram size -> count
     network.tap = [&](const Network::Datagram& datagram) {
         CHECK(datagram.data[0] == id::open_connection_request_1);
@@ -208,8 +208,8 @@ TEST_CASE("the handshake settles on the largest MTU the path carries", "[raknet]
 {
     Network network;
     network.path_mtu = 1300; // 1492-byte probes vanish, 1200-byte ones get through
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     const auto ids = connect(network, client, server);
 
     CHECK(client.engine.connection_info(ids.first)->mtu == 1200);
@@ -231,9 +231,9 @@ TEST_CASE("the password is checked by the server", "[raknet][engine]")
     Network network;
     Config config = server_config();
     config.incoming_password = {'s', 'e', 'c', 'r', 'e', 't'};
-    Peer& server = network.add(config);
-    Peer& wrong = network.add();
-    Peer& right = network.add();
+    Node& server = network.add(config);
+    Node& wrong = network.add();
+    Node& right = network.add();
 
     std::error_code ec;
     const Bytes bad{'g', 'u', 'e', 's', 's'};
@@ -257,10 +257,10 @@ TEST_CASE("connections beyond the incoming limit are refused", "[raknet][engine]
     Network network;
     Config config;
     config.max_incoming_connections = 1;
-    Peer& server = network.add(config);
-    Peer& first = network.add();
-    Peer& second = network.add();
-    Peer& closed = network.add(); // max_incoming_connections = 0: accepts nobody
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    Node& closed = network.add(); // max_incoming_connections = 0: accepts nobody
 
     connect(network, first, server);
 
@@ -288,7 +288,7 @@ TEST_CASE("connect reports misuse through the error code", "[raknet][engine]")
 
     Config tiny;
     tiny.max_connections = 1;
-    Peer& limited = s.network.add(tiny);
+    Node& limited = s.network.add(tiny);
     CHECK(limited.engine.connect(s.server.address, {}, ec) != invalid_connection);
     CHECK_FALSE(ec);
     CHECK(limited.engine.connect(s.client.address, {}, ec) == invalid_connection);
@@ -302,7 +302,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("different protocol version")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -315,7 +315,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("server demands transport security")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -331,7 +331,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("banned")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -344,7 +344,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
 TEST_CASE("a client speaking another protocol version is told so", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
+    Node& server = network.add(server_config());
     const Endpoint stranger(IpAddress::v4(10, 9, 9, 9), 1234);
     std::vector<Bytes> replies;
     network.tap = [&](const Network::Datagram& datagram) {
@@ -546,8 +546,8 @@ TEST_CASE("messages larger than the configured limit are refused", "[raknet][eng
     Network network;
     Config config = server_config();
     config.max_message_size = 10'000;
-    Peer& server = network.add(config);
-    Peer& client = network.add(config);
+    Node& server = network.add(config);
+    Node& client = network.add(config);
     const auto ids = connect(network, client, server);
 
     SendOptions options;
@@ -612,7 +612,7 @@ TEST_CASE("send rejects invalid requests", "[raknet][engine]")
     CHECK(ec == make_error_code(Errc::invalid_argument));
 
     // Not established yet.
-    Peer& late = s.network.add();
+    Node& late = s.network.add();
     const ConnectionId pending = late.engine.connect(s.server.address, {}, ec);
     REQUIRE_FALSE(ec);
     late.engine.send(pending, user_message(1), SendOptions(), ec);
@@ -714,8 +714,8 @@ TEST_CASE("an idle connection stays alive on keep-alives", "[raknet][engine]")
 TEST_CASE("next_deadline reflects pending work", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     CHECK_FALSE(client.engine.next_deadline()); // nothing to do
 
     const auto ids = connect(network, client, server);
@@ -736,9 +736,9 @@ TEST_CASE("unconnected pings are answered with the offline response", "[raknet][
     Network network;
     Config config = server_config();
     config.offline_ping_response = {'m', 'o', 't', 'd'};
-    Peer& server = network.add(config);
-    Peer& closed = network.add(); // accepts no connections
-    Peer& client = network.add();
+    Node& server = network.add(config);
+    Node& closed = network.add(); // accepts no connections
+    Node& client = network.add();
 
     client.engine.ping(server.address);
     client.engine.ping(closed.address, true); // "only if accepting": stays unanswered
@@ -765,8 +765,8 @@ TEST_CASE("unconnected pings are answered with the offline response", "[raknet][
 TEST_CASE("advertise reaches a peer without a connection", "[raknet][engine]")
 {
     Network network;
-    Peer& a = network.add();
-    Peer& b = network.add();
+    Node& a = network.add();
+    Node& b = network.add();
 
     std::error_code ec;
     a.engine.advertise(b.address, Bytes{'h', 'e', 'y'}, ec);
@@ -857,8 +857,8 @@ TEST_CASE("a sender that never completes its split messages cannot exhaust memor
     Network network;
     Config config = server_config();
     config.max_message_size = 64 * 1024;
-    Peer& server = network.add(config);
-    Peer& client = network.add();
+    Node& server = network.add(config);
+    Node& client = network.add();
     connect(network, client, server);
 
     // Open ever more split messages, one small chunk each, and never finish any of them.
@@ -889,7 +889,7 @@ TEST_CASE("a sender that never completes its split messages cannot exhaust memor
 TEST_CASE("an unverified peer must present a connection request first", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
+    Node& server = network.add(server_config());
     const Endpoint stranger(IpAddress::v4(10, 9, 9, 9), 1234);
     std::vector<Bytes> replies;
     network.tap = [&](const Network::Datagram& datagram) {
