@@ -1,6 +1,7 @@
 #include "pzynet/rakpeer/peer.hpp"
 
 #include "pzynet/raknet/message_ids.hpp"
+#include "pzynet/socket/resolver.hpp"
 #include "pzynet/transport/udp_host.hpp"
 
 #include <map>
@@ -20,7 +21,9 @@ std::uint8_t failure_id(transport::ConnectFailure reason) noexcept
     {
     case ConnectFailure::no_response: return id::connection_attempt_failed;
     case ConnectFailure::incompatible_protocol: return id::incompatible_protocol_version;
-    case ConnectFailure::connection_refused: return id::no_free_incoming_connections;
+    case ConnectFailure::connection_refused: return id::connection_attempt_failed;
+    case ConnectFailure::no_free_slots: return id::no_free_incoming_connections;
+    case ConnectFailure::recently_connected: return id::ip_recently_connected;
     case ConnectFailure::already_connected: return id::already_connected;
     case ConnectFailure::banned: return id::connection_banned;
     case ConnectFailure::invalid_credentials: return id::invalid_password;
@@ -91,7 +94,12 @@ struct Peer::Impl
                                remote);
         }
         if (const auto* failed = std::get_if<transport::ConnectFailed>(&event))
-            return make_packet(failure_id(failed->reason), RemoteSystem{Guid{}, failed->remote});
+        {
+            Packet packet = make_packet(failure_id(failed->reason), RemoteSystem{Guid{}, failed->remote});
+            if (packet.id == id::remote_system_requires_public_key)
+                packet.data.push_back(0); // RakPeer reports this one as [id][0]
+            return packet;
+        }
         if (const auto* disconnected = std::get_if<transport::Disconnected>(&event))
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -177,6 +185,25 @@ void Peer::connect(const Endpoint& to, ByteView password, std::error_code& ec)
         return;
     }
     impl_->host.connect(to, password, ec);
+}
+
+void Peer::connect(std::string_view host, std::uint16_t port, ByteView password, std::error_code& ec)
+{
+    ec.clear();
+    if (!impl_)
+    {
+        ec = make_error_code(Errc::not_open);
+        return;
+    }
+    const std::vector<Endpoint> endpoints = resolve(host, port, ResolveFamily::v4, ec);
+    if (ec)
+        return;
+    if (endpoints.empty())
+    {
+        ec = make_error_code(Errc::host_not_found);
+        return;
+    }
+    connect(endpoints.front(), password, ec);
 }
 
 void Peer::disconnect(const Remote& remote, transport::DisconnectMode mode)

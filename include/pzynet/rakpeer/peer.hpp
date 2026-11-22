@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <system_error>
 #include <variant>
 
@@ -98,6 +99,15 @@ public:
     {
         std::error_code ec;
         connect(to, password, ec);
+        detail::throw_if(ec, "Peer::connect");
+    }
+    /// Connects by host name (or address literal), resolved synchronously to its first IPv4 address.
+    /// A name that does not resolve fails the call with Errc::host_not_found; no Packet follows.
+    void connect(std::string_view host, std::uint16_t port, ByteView password, std::error_code& ec);
+    void connect(std::string_view host, std::uint16_t port, ByteView password = ByteView())
+    {
+        std::error_code ec;
+        connect(host, port, password, ec);
         detail::throw_if(ec, "Peer::connect");
     }
 

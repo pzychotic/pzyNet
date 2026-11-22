@@ -9,10 +9,12 @@
 #include "pzynet/raknet/wire.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <utility>
 
 using namespace pzynet;
 using namespace pzynet::raknet;
@@ -268,8 +270,8 @@ TEST_CASE("connections beyond the incoming limit are refused", "[raknet][engine]
     second.engine.connect(server.address, {}, ec);
     first.engine.connect(closed.address, {}, ec);
     REQUIRE(network.run_until([&] { return second.count<ConnectFailed>() == 1 && first.count<ConnectFailed>() == 1; }));
-    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::connection_refused);
-    CHECK(first.all<ConnectFailed>()[0].reason == ConnectFailure::connection_refused);
+    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::no_free_slots);
+    CHECK(first.all<ConnectFailed>()[0].reason == ConnectFailure::no_free_slots);
     CHECK(server.engine.connection_count() == 1);
 
     // Raising the limit at run time lets the next attempt in.
@@ -338,6 +340,22 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
         network.inject(server, client.address, wire::encode(wire::Rejection{id::connection_banned, 1}));
         REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }, 1s));
         CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+    }
+    SECTION("each refusal keeps its own reason")
+    {
+        const auto [refusal, reason] = GENERATE(
+            std::make_pair(id::no_free_incoming_connections, ConnectFailure::no_free_slots),
+            std::make_pair(id::ip_recently_connected, ConnectFailure::recently_connected),
+            std::make_pair(id::already_connected, ConnectFailure::already_connected),
+            std::make_pair(id::connection_attempt_failed, ConnectFailure::connection_refused));
+        Network network;
+        Node& client = network.add();
+        std::error_code ec;
+        client.engine.connect(server, {}, ec);
+        network.run(20ms);
+        network.inject(server, client.address, wire::encode(wire::Rejection{refusal, 1}));
+        REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }, 1s));
+        CHECK(client.all<ConnectFailed>()[0].reason == reason);
     }
 }
 
