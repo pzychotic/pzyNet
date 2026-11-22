@@ -289,3 +289,121 @@ TEST_CASE("BitStream: skipping moves the read position by bits or bytes", "[rakn
     CHECK(reader.read<std::uint8_t>() == 0x67);
     CHECK(reader.ok());
 }
+
+TEST_CASE("BitStream: every kind of read past the end fails, stays failed and reads nothing",
+          "[raknet][bitstream]")
+{
+    // The view covers only the first two bytes; the guard bytes behind it must never be read.
+    const Bytes storage{0xFF, 0xFF, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+    const ByteView data(storage.data(), 2);
+
+    SECTION("float")
+    {
+        BitStreamReader reader(data);
+        CHECK(reader.read<float>() == 0.0f);
+        CHECK_FALSE(reader.ok());
+    }
+    SECTION("double after a bit")
+    {
+        BitStreamReader reader(data);
+        CHECK(reader.read<bool>());
+        CHECK(reader.read<double>() == 0.0);
+        CHECK_FALSE(reader.ok());
+    }
+    SECTION("raw bits, leaving the output zeroed")
+    {
+        BitStreamReader reader(data);
+        std::uint8_t out[3] = {0xEE, 0xEE, 0xEE};
+        CHECK_FALSE(reader.read_bits(out, 17));
+        CHECK(Bytes(out, out + 3) == Bytes{0, 0, 0});
+        CHECK_FALSE(reader.ok());
+    }
+    SECTION("raw bits into a buffer that is too small")
+    {
+        BitStreamReader reader(data);
+        std::uint8_t out[1] = {0xEE};
+        CHECK_FALSE(reader.read_bits(out, 9));
+        CHECK_FALSE(reader.ok());
+    }
+    SECTION("aligned bytes")
+    {
+        BitStreamReader reader(data);
+        CHECK(reader.read<bool>());
+        std::uint8_t out[2] = {};
+        CHECK_FALSE(reader.read_aligned_bytes(out)); // aligned to bit 8, one byte left
+        CHECK_FALSE(reader.ok());
+    }
+    SECTION("skipping")
+    {
+        BitStreamReader reader(data);
+        reader.skip_bytes(3);
+        CHECK_FALSE(reader.ok());
+        CHECK(reader.bit_position() == 0);
+    }
+
+    // Whatever failed, the reader stays failed even for reads that would fit.
+    BitStreamReader reader(data);
+    CHECK(reader.read<std::uint32_t>() == 0);
+    CHECK(reader.read<bool>() == false);
+    std::uint8_t out[1] = {0xEE};
+    CHECK_FALSE(reader.read_bytes(out));
+    CHECK(out[0] == 0);
+    CHECK_FALSE(reader.ok());
+}
+
+namespace game
+{
+struct Position
+{
+    std::int16_t x = 0;
+    float y = 0;
+};
+struct Unit
+{
+    bool alive = false;
+    Position where;
+};
+
+void write(BitStreamWriter& out, const Position& p)
+{
+    out.write(p.x);
+    out.write(p.y);
+}
+void read(BitStreamReader& in, Position& p)
+{
+    p.x = in.read<std::int16_t>();
+    p.y = in.read<float>();
+}
+void write(BitStreamWriter& out, const Unit& u)
+{
+    out.write(u.alive);
+    out.write(u.where);
+}
+void read(BitStreamReader& in, Unit& u)
+{
+    in.read(u.alive);
+    in.read(u.where);
+}
+} // namespace game
+
+TEST_CASE("BitStream: user types are written and read through their read/write free functions",
+          "[raknet][bitstream]")
+{
+    BitStreamWriter writer;
+    writer.write(game::Unit{true, {-2, 1.0f}});
+    // 1 | 11111111 11111110 | 00111111 10000000 00000000 00000000
+    CHECK(writer.bit_count() == 49);
+    CHECK(bytes_of(writer) == Bytes{0xFF, 0xFF, 0x1F, 0xC0, 0x00, 0x00, 0x00});
+
+    BitStreamReader reader(writer.data());
+    const game::Unit unit = reader.read<game::Unit>();
+    CHECK(reader.ok());
+    CHECK(unit.alive);
+    CHECK(unit.where.x == -2);
+    CHECK(unit.where.y == 1.0f);
+
+    BitStreamReader short_reader(writer.data().first(4));
+    game::Unit partial;
+    CHECK_FALSE(short_reader.read(partial));
+    CHECK_FALSE(short_reader.ok());
+}

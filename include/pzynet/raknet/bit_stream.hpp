@@ -23,6 +23,9 @@ enum class ByteOrder : std::uint8_t
     little_endian,
 };
 
+class BitStreamWriter;
+class BitStreamReader;
+
 namespace bit_stream_detail
 {
 
@@ -30,6 +33,48 @@ template <class T>
 struct always_false : std::false_type
 {
 };
+
+// User-type hooks, found by argument-dependent lookup in the user type's namespace. The deleted
+// declarations stop ordinary lookup here, so unrelated read/write functions of enclosing
+// namespaces (or ::read/::write from POSIX) are never considered.
+void write() = delete;
+void read() = delete;
+
+template <class T, class = void>
+struct has_write_hook : std::false_type
+{
+};
+template <class T>
+struct has_write_hook<T, std::void_t<decltype(write(std::declval<BitStreamWriter&>(), std::declval<const T&>()))>>
+    : std::true_type
+{
+};
+template <class T, class = void>
+struct has_read_hook : std::false_type
+{
+};
+template <class T>
+struct has_read_hook<T, std::void_t<decltype(read(std::declval<BitStreamReader&>(), std::declval<T&>()))>>
+    : std::true_type
+{
+};
+
+template <class T>
+void call_write_hook(BitStreamWriter& out, const T& value)
+{
+    static_assert(has_write_hook<T>::value,
+                  "BitStreamWriter::write: unsupported type; for a user type, declare "
+                  "void write(pzynet::raknet::BitStreamWriter&, const T&) in T's namespace");
+    write(out, value);
+}
+template <class T>
+void call_read_hook(BitStreamReader& in, T& value)
+{
+    static_assert(has_read_hook<T>::value,
+                  "BitStreamReader::read: unsupported type; for a user type, declare "
+                  "void read(pzynet::raknet::BitStreamReader&, T&) in T's namespace");
+    read(in, value);
+}
 
 template <std::size_t Size>
 struct uint_of_size;
@@ -87,7 +132,9 @@ public:
     /// - bool: one bit;
     /// - integers and enums: their full width (an enum's underlying type), two's complement, in the
     ///   stream's byte order;
-    /// - float, double: their IEEE 754 bits, in the stream's byte order.
+    /// - float, double: their IEEE 754 bits, in the stream's byte order;
+    /// - any other type: through a free function `void write(BitStreamWriter&, const T&)` declared in
+    ///   T's namespace, found by argument-dependent lookup.
     template <class T>
     void write(const T& value)
     {
@@ -100,7 +147,7 @@ public:
         else if constexpr (std::is_floating_point<T>::value)
             write_integer(bit_stream_detail::float_bits(value), sizeof(T));
         else
-            static_assert(bit_stream_detail::always_false<T>::value, "BitStreamWriter::write: unsupported type");
+            bit_stream_detail::call_write_hook(*this, value);
     }
 
     /// Writes `bit_count` raw bits from `bytes`, as RakNet's WriteBits: whole bytes in order, most
@@ -151,7 +198,8 @@ public:
     /// Bits left to read; padding bits of the last byte count, as they do in RakNet.
     std::size_t bits_remaining() const noexcept { return bits_.bits_remaining(); }
 
-    /// Reads a value written as BitStreamWriter::write() writes it.
+    /// Reads a value written as BitStreamWriter::write() writes it. A user type is default-constructed
+    /// and then filled by a free function `void read(BitStreamReader&, T&)` declared in its namespace.
     template <class T>
     T read()
     {
@@ -164,7 +212,23 @@ public:
         else if constexpr (std::is_floating_point<T>::value)
             return bit_stream_detail::float_from_bits<T>(read_integer(sizeof(T)));
         else
-            static_assert(bit_stream_detail::always_false<T>::value, "BitStreamReader::read: unsupported type");
+        {
+            T value{};
+            bit_stream_detail::call_read_hook(*this, value);
+            return value;
+        }
+    }
+
+    /// Reads into `value` (a user type through its read() hook, without default-constructing a
+    /// new one) and returns ok(): false if this or any earlier read failed.
+    template <class T>
+    bool read(T& value)
+    {
+        if constexpr (std::is_arithmetic<T>::value || std::is_enum<T>::value)
+            value = read<T>();
+        else
+            bit_stream_detail::call_read_hook(*this, value);
+        return ok_;
     }
 
     /// Reads `bit_count` raw bits into `out`, the inverse of BitStreamWriter::write_bits(): the first
