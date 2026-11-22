@@ -7,7 +7,7 @@ namespace pzynet
 namespace raknet
 {
 
-void BitStreamWriter::write(bool value)
+void BitStreamWriter::write_bit(bool value)
 {
     BitWriter(data_, bits_).bit(value);
     ++bits_;

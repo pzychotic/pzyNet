@@ -95,3 +95,67 @@ TEST_CASE("BitStream: reading past the end fails once and stays failed", "[rakne
     CHECK(reader.read<bool>() == false); // the failure latches, although a bit would be left
     CHECK_FALSE(reader.ok());
 }
+
+namespace
+{
+enum class Shade : std::uint16_t
+{
+    dark = 0x0102,
+};
+enum Plain // unscoped, int-sized as in most RakNet code
+{
+    plain_seven = 7,
+};
+enum class Tiny : std::int8_t
+{
+    minus_two = -2,
+};
+} // namespace
+
+TEST_CASE("BitStream: enums are written in the width of their underlying type", "[raknet][bitstream]")
+{
+    BitStreamWriter big;
+    big.write(Shade::dark);
+    big.write(plain_seven);
+    big.write(Tiny::minus_two);
+    CHECK(bytes_of(big) == Bytes{0x01, 0x02, 0x00, 0x00, 0x00, 0x07, 0xFE});
+
+    BitStreamWriter little(ByteOrder::little_endian);
+    little.write(Shade::dark);
+    little.write(plain_seven);
+    little.write(Tiny::minus_two);
+    CHECK(bytes_of(little) == Bytes{0x02, 0x01, 0x07, 0x00, 0x00, 0x00, 0xFE});
+
+    BitStreamReader reader(little.data(), ByteOrder::little_endian);
+    CHECK(reader.read<Shade>() == Shade::dark);
+    CHECK(reader.read<Plain>() == plain_seven);
+    CHECK(reader.read<Tiny>() == Tiny::minus_two);
+    CHECK(reader.ok());
+}
+
+TEST_CASE("BitStream: float and double are their IEEE 754 bits in the stream's byte order", "[raknet][bitstream]")
+{
+    // 1.0f = 0x3F800000, -2.5 = 0xC004000000000000
+    BitStreamWriter big;
+    big.write(true);
+    big.write(1.0f);
+    big.write(-2.5);
+    // 1 | 00111111 10000000 00000000 00000000 | 11000000 00000100 00000000 ... (6 more zero bytes)
+    CHECK(big.bit_count() == 97);
+    CHECK(bytes_of(big) == Bytes{0x9F, 0xC0, 0x00, 0x00, 0x60, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+
+    BitStreamWriter little(ByteOrder::little_endian);
+    little.write(1.0f);
+    little.write(-2.5);
+    CHECK(bytes_of(little) == Bytes{0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0xC0});
+
+    BitStreamReader from_big(big.data());
+    CHECK(from_big.read<bool>());
+    CHECK(from_big.read<float>() == 1.0f);
+    CHECK(from_big.read<double>() == -2.5);
+    CHECK(from_big.ok());
+    BitStreamReader from_little(little.data(), ByteOrder::little_endian);
+    CHECK(from_little.read<float>() == 1.0f);
+    CHECK(from_little.read<double>() == -2.5);
+    CHECK(from_little.ok());
+}
