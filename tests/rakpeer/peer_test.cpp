@@ -45,6 +45,11 @@ public:
         return *peers_.back();
     }
 
+    void destroy(Peer& peer)
+    {
+        peers_.erase(std::find_if(peers_.begin(), peers_.end(), [&](const auto& p) { return p.get() == &peer; }));
+    }
+
     /// Stops running the network of an app-driven Peer, so it falls silent.
     void pause(Peer& peer) { paused_.push_back(&peer); }
 
@@ -224,6 +229,97 @@ TEST_CASE("Peer: shutdown, and destruction, stop the network and release the soc
     REQUIRE_FALSE(ec);
     socket.bind(bound, ec); // fails while another socket holds the port
     CHECK_FALSE(ec);
+}
+
+TEST_CASE("Peer: after shutdown with a linger, the remote receives every reliable message queued before it, "
+          "then a disconnection notification",
+          "[rakpeer]")
+{
+    // The remote runs on its own thread, so that it keeps working while shutdown() blocks.
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    Network net;
+    auto [server, client] =
+        net.connected_pair(loopback_config(Threading::background, 4), loopback_config(threading));
+
+    constexpr int message_count = 200;
+    for (int i = 0; i < message_count; ++i)
+    {
+        std::vector<std::uint8_t> message(600, 0xAB);
+        message[0] = id::user_packet_enum;
+        message[1] = static_cast<std::uint8_t>(i);
+        message[2] = static_cast<std::uint8_t>(i >> 8);
+        client.send(server.guid(), message);
+    }
+    const Guid client_guid = client.guid();
+
+    const auto started = SteadyClock::now();
+    client.shutdown(5000ms);
+    CHECK(SteadyClock::now() - started < 4s); // returns once the remote acknowledged everything
+    CHECK_FALSE(client.running());
+
+    for (int i = 0; i < message_count; ++i)
+    {
+        const std::optional<Packet> packet = net.wait_for_packet(server);
+        REQUIRE(packet);
+        REQUIRE(packet->id == id::user_packet_enum);
+        REQUIRE(packet->data.size() == 600);
+        CHECK(packet->data[1] + (packet->data[2] << 8) == i);
+    }
+    const std::optional<Packet> notification = net.wait_for_packet(server);
+    REQUIRE(notification);
+    CHECK(notification->id == id::disconnection_notification);
+    CHECK(notification->guid == client_guid);
+}
+
+TEST_CASE("Peer: shutdown with zero linger, and destruction, return at once; the remote loses the connection",
+          "[rakpeer]")
+{
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    const bool destroy = GENERATE(false, true);
+    Network net;
+    PeerConfig server_config = loopback_config(Threading::background, 4);
+    server_config.engine.timeout = 500ms;
+    Peer& server = net.add(server_config);
+    Peer& client = net.add(loopback_config(threading));
+    client.connect(server.local_endpoint());
+    REQUIRE(net.wait_for_packet(client));
+    REQUIRE(net.wait_for_packet(server));
+    const Guid client_guid = client.guid();
+
+    for (int i = 0; i < 50; ++i)
+        client.send(server.guid(), std::vector<std::uint8_t>(600, id::user_packet_enum));
+
+    const auto started = SteadyClock::now();
+    if (destroy)
+        net.destroy(client);
+    else
+        client.shutdown(0ms);
+    CHECK(SteadyClock::now() - started < 200ms);
+
+    std::optional<Packet> packet;
+    do
+        packet = net.wait_for_packet(server);
+    while (packet && packet->id == id::user_packet_enum); // whatever got out before the shutdown
+    REQUIRE(packet);
+    CHECK(packet->id == id::connection_lost);
+    CHECK(packet->guid == client_guid);
+}
+
+TEST_CASE("Peer: shutdown never blocks longer than the linger", "[rakpeer]")
+{
+    const Threading threading = GENERATE(Threading::background, Threading::app_driven);
+    Network net;
+    auto [server, client] =
+        net.connected_pair(loopback_config(Threading::app_driven, 4), loopback_config(threading));
+    net.pause(server); // never acknowledges the disconnection notification
+
+    client.send(server.guid(), std::vector<std::uint8_t>{id::user_packet_enum});
+    const auto started = SteadyClock::now();
+    client.shutdown(300ms);
+    const auto elapsed = SteadyClock::now() - started;
+    CHECK(elapsed >= 300ms);
+    CHECK(elapsed < 300ms + 150ms);
+    CHECK_FALSE(client.running());
 }
 
 TEST_CASE("Peer: a shut-down Peer can be started again", "[rakpeer]")

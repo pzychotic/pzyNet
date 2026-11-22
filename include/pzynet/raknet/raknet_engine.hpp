@@ -95,6 +95,11 @@ public:
     std::uint64_t guid() const noexcept;
     std::size_t connection_count() const noexcept;
     std::optional<ConnectionInfo> connection_info(transport::ConnectionId connection) const;
+    /// Every connection visible to the application (connected or still connecting), in no particular order.
+    std::vector<transport::ConnectionId> connections() const;
+    /// Connections closed gracefully that are still getting their last data out; each goes once the
+    /// remote has acknowledged everything, or after the time-out.
+    std::size_t closing_count() const noexcept;
 
     void set_max_incoming_connections(std::size_t count);
     void set_incoming_password(ByteView password);

@@ -3,8 +3,10 @@
 #include "pzynet/raknet/message_ids.hpp"
 #include "pzynet/transport/udp_host.hpp"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
+#include <thread>
 
 namespace pzynet
 {
@@ -124,6 +126,48 @@ struct Peer::Impl
         }
         return std::nullopt; // receipts and offline datagrams are not reported yet
     }
+
+    /// Closes every connection gracefully and runs the network until all of them have got their last
+    /// data out, or until linger has passed. Events are discarded.
+    void linger_and_close(std::chrono::milliseconds linger)
+    {
+        using SteadyClock = std::chrono::steady_clock;
+        const SteadyClock::time_point give_up = SteadyClock::now() + linger;
+        host.with_engine([this](transport::Engine&) {
+            engine.set_max_incoming_connections(0);
+            for (const transport::ConnectionId connection : engine.connections())
+                engine.disconnect(connection, transport::DisconnectMode::graceful);
+        });
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connections.clear();
+        }
+        const bool threaded = host.threaded();
+        for (;;)
+        {
+            transport::Event event;
+            while (host.poll_event(event))
+            {
+            }
+            if (host.with_engine([this](transport::Engine&) { return engine.closing_count(); }) == 0)
+                return;
+            const SteadyClock::time_point now = SteadyClock::now();
+            if (now >= give_up)
+                return;
+            // Short steps: in threaded mode only polling notices the end.
+            const auto step = std::min<std::chrono::milliseconds>(
+                std::chrono::ceil<std::chrono::milliseconds>(give_up - now), std::chrono::milliseconds(5));
+            if (threaded)
+                std::this_thread::sleep_for(step);
+            else
+            {
+                std::error_code ec;
+                host.update(step, ec);
+                if (ec)
+                    return;
+            }
+        }
+    }
 };
 
 Peer::Peer() noexcept = default;
@@ -151,8 +195,21 @@ void Peer::start(PeerConfig config, std::error_code& ec)
         impl_ = std::move(impl);
 }
 
-void Peer::shutdown() noexcept
+void Peer::shutdown(std::chrono::milliseconds linger) noexcept
 {
+    if (!impl_)
+        return;
+    if (linger > std::chrono::milliseconds(0))
+    {
+        try
+        {
+            impl_->linger_and_close(linger);
+        }
+        catch (...)
+        {
+            // dropping is all that is left
+        }
+    }
     impl_.reset(); // the host stops its thread and closes the socket; the engine goes silently
 }
 
