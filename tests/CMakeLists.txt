@@ -43,9 +43,10 @@ if(PZYNET_RAKNET_INTEROP_DIR)
     add_subdirectory("${PZYNET_RAKNET_INTEROP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/raknet" EXCLUDE_FROM_ALL)
 
     add_executable(pzynet_interop_tests
-        interop/raknet_interop_test.cpp)
+        interop/raknet_interop_test.cpp
+        interop/rakpeer_interop_test.cpp)
     target_link_libraries(pzynet_interop_tests PRIVATE
-        pzynet::transport pzynet::raknet RakNetStatic Catch2::Catch2WithMain)
+        pzynet::transport pzynet::raknet pzynet::rakpeer RakNetStatic Catch2::Catch2WithMain)
     target_include_directories(pzynet_interop_tests SYSTEM PRIVATE "${PZYNET_RAKNET_INTEROP_DIR}/Source")
     target_compile_features(pzynet_interop_tests PRIVATE cxx_std_17)
     catch_discover_tests(pzynet_interop_tests PROPERTIES TIMEOUT 180)
