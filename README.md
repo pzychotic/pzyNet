@@ -147,6 +147,15 @@ out.write(game::Position{3, 1.5f});
 game::Position p = in.read<game::Position>(); // or: in.read(p) returns ok()
 ```
 
+A hook that finds an invalid value can call `in.fail()`.
+
+RakNet's own types are built in, with RakNet's encodings: `write(raknet::Guid)` (its 64-bit value),
+`write(Endpoint)` (RakNet's IPv4 SystemAddress; an IPv6 endpoint is an error, `address_family_mismatch`),
+`write_uint24()` (byte-aligned, little-endian), `write_string()` (RakString: 16-bit length, then the
+bytes from the next byte boundary) and `write_wide_string()` (RakWString, which upstream also uses for
+its non-Huffman `WriteCompressed` of wide strings: 16-bit count, then 16-bit code units), each with its
+`read` counterpart.
+
 RakNet's space-saving encodings have their own calls, each with a matching read: `write_compressed()`
 (integers without their zero bytes, floats and doubles in [-1, 1] as 16 and 32 bits), `write_delta()` and
 `write_compressed_delta()` (one bit for an unchanged value), `write_float16(value, min, max)` and

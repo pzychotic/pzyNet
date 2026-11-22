@@ -1,13 +1,19 @@
 #pragma once
 
+#include "pzynet/core/address.hpp"
 #include "pzynet/core/bit_io.hpp"
+#include "pzynet/core/error.hpp"
 #include "pzynet/core/span.hpp"
+#include "pzynet/raknet/guid.hpp"
 
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <vector>
 
@@ -35,11 +41,16 @@ struct always_false : std::false_type
 {
 };
 
-// User-type hooks, found by argument-dependent lookup in the user type's namespace. The deleted
-// declarations stop ordinary lookup here, so unrelated read/write functions of enclosing
-// namespaces (or ::read/::write from POSIX) are never considered.
-void write() = delete;
-void read() = delete;
+// User-type hooks, found by argument-dependent lookup in the user type's namespace. The two
+// declarations below stop ordinary lookup here, so unrelated read/write functions of enclosing
+// namespaces (or ::read/::write from POSIX) are never considered. They take a type nobody passes and
+// are never defined; deleted functions would do, but MSVC without /permissive- then fails to detect
+// hooks that exist.
+struct no_hook
+{
+};
+void write(no_hook);
+void read(no_hook);
 
 template <class T, class = void>
 struct has_write_hook : std::false_type
@@ -310,6 +321,33 @@ public:
         write_ranged_offset(offset, bit_stream_detail::bit_width(span));
     }
 
+    // --- RakNet's own types and strings (bit_stream_types.cpp) ---
+
+    /// Aligns to a byte boundary, then writes the low 24 bits of `value` as three bytes, least
+    /// significant first, whatever the stream's byte order (RakNet's Write(uint24_t)).
+    void write_uint24(std::uint32_t value);
+    /// Writes an IPv4 endpoint as RakNet's Write(SystemAddress): the version byte 4, the four address
+    /// bytes bitwise inverted, then the port, big-endian whatever the stream's byte order; unaligned.
+    /// An IPv6 endpoint (an IPv4-mapped one included) fails with Errc::address_family_mismatch and
+    /// writes nothing. write(endpoint) throws std::system_error instead.
+    void write(const Endpoint& endpoint, std::error_code& ec);
+
+    /// Writes a string as RakNet's Write(RakString) / RakString::Serialize: its length as a uint16 in
+    /// the stream's byte order at the current bit position, then its bytes from the next byte boundary
+    /// (aligning even when the string is empty). Every byte is written, a zero byte too; upstream would
+    /// stop a C string there. A string of more than 65535 bytes, which RakNet would truncate silently,
+    /// fails with Errc::invalid_argument and writes nothing; the overload without `ec` throws
+    /// std::system_error.
+    void write_string(std::string_view text, std::error_code& ec);
+    void write_string(std::string_view text);
+    /// Writes a wide string as upstream RakNet's RakWString::Serialize, which both Write(RakWString)
+    /// and WriteCompressed(RakWString) / WriteCompressed(const wchar_t*) use - the only "compressed"
+    /// strings upstream does not Huffman-code: the count of UTF-16 code units, then each code unit,
+    /// all as uint16 in the stream's byte order with no alignment. More than 65535 code units fail
+    /// with Errc::invalid_argument and write nothing (RakNet would write a truncated count).
+    void write_wide_string(std::u16string_view text, std::error_code& ec);
+    void write_wide_string(std::u16string_view text);
+
 private:
     void write_compressed_integer(std::uint64_t value, std::size_t width);
     void write_ranged_offset(std::uint64_t offset, std::size_t bit_count);
@@ -479,6 +517,19 @@ public:
         return static_cast<T>(static_cast<U>(offset + static_cast<U>(min)));
     }
 
+    // --- RakNet's own types and strings (bit_stream_types.cpp) ---
+
+    /// Aligns to a byte boundary, then reads a value written by write_uint24().
+    std::uint32_t read_uint24();
+    /// Reads a string written by write_string() (RakNet's Read(RakString)): the uint16 length, then
+    /// aligns - also for an empty string - and reads that many bytes. Returns "" on failure.
+    std::string read_string();
+    /// Reads a wide string written by write_wide_string(). Returns an empty string on failure.
+    std::u16string read_wide_string();
+
+    /// Latches ok() == false, e.g. from a user type's read() hook that finds an invalid value.
+    void fail() noexcept { ok_ = false; }
+
 private:
     std::uint64_t read_compressed_integer(std::size_t width);
     std::uint64_t read_ranged_offset(std::size_t bit_count);
@@ -491,6 +542,25 @@ private:
     ByteOrder order_;
     bool ok_ = true;
 };
+
+// --- RakNet's own types: write()/read() hooks, found by argument-dependent lookup ---
+
+/// A GUID is its 64-bit value in the stream's byte order, unaligned (RakNet's Write(RakNetGUID)).
+inline void write(BitStreamWriter& out, const Guid& guid)
+{
+    out.write(guid.value);
+}
+inline void read(BitStreamReader& in, Guid& guid)
+{
+    guid.value = in.read<std::uint64_t>();
+}
+
+/// An endpoint as BitStreamWriter::write(const Endpoint&, std::error_code&) writes it; throws
+/// std::system_error for an IPv6 endpoint.
+void write(BitStreamWriter& out, const Endpoint& endpoint);
+/// Reads an IPv4 endpoint. Any other version byte fails the reader, as in a RakNet build without
+/// IPv6 support (the default).
+void read(BitStreamReader& in, Endpoint& endpoint);
 
 } // namespace raknet
 } // namespace pzynet
