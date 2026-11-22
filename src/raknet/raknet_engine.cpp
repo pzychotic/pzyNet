@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <deque>
 #include <random>
+#include <string>
 #include <unordered_map>
 
 namespace pzynet
@@ -99,6 +100,31 @@ std::uint16_t clamp_mtu(std::size_t mtu) noexcept
         std::min<std::size_t>(std::max<std::size_t>(mtu, wire::minimum_mtu), wire::maximum_mtu));
 }
 
+constexpr std::size_t maximum_ban_length = 15; // a dotted IPv4 address, as RakNet allows
+
+struct Ban
+{
+    std::string address;
+    std::optional<TimePoint> expiry; // nullopt = permanent
+};
+
+/// RakNet's IsBanned matching: equal strings match, and a '*' in the ban matches whatever follows.
+bool ban_matches(std::string_view ban, std::string_view address) noexcept
+{
+    for (std::size_t i = 0;; ++i)
+    {
+        const char b = i < ban.size() ? ban[i] : '\0';
+        const char a = i < address.size() ? address[i] : '\0';
+        if (b == a)
+        {
+            if (a == '\0')
+                return true;
+            continue;
+        }
+        return b == '*' && a != '\0';
+    }
+}
+
 template <class T>
 bool pop(std::deque<T>& queue, T& out)
 {
@@ -123,8 +149,33 @@ struct RakNetEngine::Impl
     std::vector<Bytes> scratch;
     // Pings are stamped with the send time, so they wait for the next advance() to learn it.
     std::vector<std::pair<Endpoint, bool>> pending_pings;
+    std::vector<Ban> bans;
 
     std::uint64_t now_ms() const noexcept { return RakNetEngine::wire_time(now); }
+
+    bool is_banned(std::string_view address, TimePoint at) const
+    {
+        return std::any_of(bans.begin(), bans.end(), [&](const Ban& ban) {
+            return (!ban.expiry || *ban.expiry >= at) && ban_matches(ban.address, address);
+        });
+    }
+
+    /// RakNet's ban check, which runs before anything else for every datagram.
+    bool refuse_if_banned(const Endpoint& from)
+    {
+        if (bans.empty())
+            return false;
+        bans.erase(std::remove_if(bans.begin(), bans.end(),
+                                  [&](const Ban& ban) { return ban.expiry && *ban.expiry < now; }),
+                   bans.end());
+        if (!is_banned(from.address().to_string(), now))
+            return false;
+        wire::Rejection rejection;
+        rejection.id = id::connection_banned;
+        rejection.guid = config.guid;
+        transmit(from, wire::encode(rejection));
+        return true;
+    }
 
     void transmit(const Endpoint& to, Bytes data, bool dont_fragment = false)
     {
@@ -665,6 +716,8 @@ void RakNetEngine::handle_datagram(const Endpoint& from, ByteView data, TimePoin
     impl.now = now;
     if (data.size() <= 2) // RakNet ignores these too; too short for any message
         return;
+    if (impl.refuse_if_banned(from))
+        return;
 
     if (const std::optional<std::uint8_t> offline = wire::offline_message_id(data))
     {
@@ -866,6 +919,45 @@ void RakNetEngine::set_incoming_password(ByteView password)
 void RakNetEngine::set_offline_ping_response(ByteView data)
 {
     impl_->config.offline_ping_response.assign(data.begin(), data.end());
+}
+
+bool RakNetEngine::ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now)
+{
+    if (address.empty() || address.size() > maximum_ban_length)
+        return false;
+    std::optional<TimePoint> expiry;
+    if (duration.count() > 0)
+        expiry = now + duration;
+    std::vector<Ban>& bans = impl_->bans;
+    const auto existing =
+        std::find_if(bans.begin(), bans.end(), [&](const Ban& ban) { return ban.address == address; });
+    if (existing != bans.end())
+        existing->expiry = expiry;
+    else
+        bans.push_back(Ban{std::string(address), expiry});
+    return true;
+}
+
+void RakNetEngine::unban(std::string_view address)
+{
+    std::vector<Ban>& bans = impl_->bans;
+    bans.erase(std::remove_if(bans.begin(), bans.end(), [&](const Ban& ban) { return ban.address == address; }),
+               bans.end());
+}
+
+void RakNetEngine::clear_bans()
+{
+    impl_->bans.clear();
+}
+
+bool RakNetEngine::is_banned(std::string_view address, TimePoint now) const
+{
+    return impl_->is_banned(address, now);
+}
+
+void RakNetEngine::set_limit_ip_connection_frequency(bool limit)
+{
+    impl_->config.limit_ip_connection_frequency = limit;
 }
 
 void RakNetEngine::ping(const Endpoint& to, bool only_if_accepting)

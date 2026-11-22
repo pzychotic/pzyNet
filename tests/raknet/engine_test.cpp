@@ -366,6 +366,130 @@ TEST_CASE("a client speaking another protocol version is told so", "[raknet][eng
     CHECK(server.engine.connection_count() == 0);
 }
 
+// --- ban list and reconnect limit ----------------------------------------------------------------
+
+TEST_CASE("a banned address is refused with the connection-banned id", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+    std::vector<Bytes> replies;
+    network.tap = [&](const Network::Datagram& datagram) {
+        if (datagram.to == client.address)
+            replies.push_back(datagram.data);
+    };
+
+    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
+    CHECK(server.engine.is_banned("10.0.0.2", network.now));
+
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+    CHECK(server.engine.connection_count() == 0);
+
+    REQUIRE_FALSE(replies.empty());
+    wire::Rejection rejection;
+    REQUIRE(wire::decode(replies[0], rejection));
+    CHECK(rejection.id == id::connection_banned);
+    CHECK(rejection.guid == server.engine.guid());
+}
+
+TEST_CASE("a ban for a duration expires", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+
+    REQUIRE(server.engine.ban("10.0.0.2", 2s, network.now));
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+
+    CHECK(server.engine.is_banned("10.0.0.2", network.now + 1s));
+    network.run(2s);
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now));
+    connect(network, client, server);
+}
+
+TEST_CASE("banning again replaces the duration", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    REQUIRE(server.engine.ban("10.0.0.2", 1s, network.now));
+    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
+    CHECK(server.engine.is_banned("10.0.0.2", network.now + 24h));
+    REQUIRE(server.engine.ban("10.0.0.2", 1s, network.now));
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now + 2s));
+}
+
+TEST_CASE("unbanning and clearing the ban list let a client in again", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+    REQUIRE(server.engine.ban("10.0.0.2", 0ms, network.now));
+    REQUIRE(server.engine.ban("10.0.0.3", 0ms, network.now));
+
+    SECTION("unban")
+    {
+        server.engine.unban("10.0.0.2");
+        CHECK(server.engine.is_banned("10.0.0.3", network.now));
+    }
+    SECTION("clear")
+    {
+        server.engine.clear_bans();
+        CHECK_FALSE(server.engine.is_banned("10.0.0.3", network.now));
+    }
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now));
+    connect(network, client, server);
+}
+
+TEST_CASE("ban entries match like RakNet's", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    RakNetEngine& engine = server.engine;
+    const TimePoint now = network.now;
+
+    REQUIRE(engine.ban("10.0.0.2", 0ms, now));
+    CHECK(engine.is_banned("10.0.0.2", now));
+    CHECK_FALSE(engine.is_banned("10.0.0.20", now)); // no prefix match without a wildcard
+    CHECK_FALSE(engine.is_banned("10.0.0.", now));
+
+    REQUIRE(engine.ban("192.168.*", 0ms, now));
+    CHECK(engine.is_banned("192.168.1.7", now));
+    CHECK(engine.is_banned("192.168.250.250", now));
+    CHECK_FALSE(engine.is_banned("192.169.1.7", now));
+
+    engine.unban("192.168"); // only the exact entry is removed
+    CHECK(engine.is_banned("192.168.1.7", now));
+
+    CHECK_FALSE(engine.ban("", 0ms, now));
+    CHECK_FALSE(engine.ban("1234:5678:9abc::1", 0ms, now)); // longer than a dotted IPv4 address
+
+    Node& client = network.add(); // 10.0.0.2 via the wildcard
+    REQUIRE(engine.ban("10.0.*", 0ms, now));
+    engine.unban("10.0.0.2");
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+}
+
+TEST_CASE("a connection from a newly banned address times out", "[raknet][engine][ban]")
+{
+    Session s;
+    REQUIRE(s.server.engine.ban("10.0.0.2", 0ms, s.network.now));
+    send(s.client, s.at_client, user_message(1));
+    REQUIRE(s.network.run_until([&] { return s.server.count<Disconnected>() == 1; }, 30s));
+    CHECK(s.server.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+    CHECK(s.server.count<Message>() == 0);
+    REQUIRE(s.network.run_until([&] { return s.client.count<Disconnected>() == 1; }, 30s));
+    CHECK(s.client.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+}
+
 // --- delivering ----------------------------------------------------------------------------------
 
 TEST_CASE("every reliability delivers on a clean link", "[raknet][engine]")
