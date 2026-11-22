@@ -52,6 +52,10 @@ struct SendOptions
     /// Ordering channel, 0..31.
     std::uint8_t channel = 0;
     transport::Priority priority = transport::Priority::medium;
+    /// Report the outcome as a receipt Packet: id::snd_receipt_acked once the message is acknowledged,
+    /// or, for unreliable messages only, id::snd_receipt_loss once it is presumed lost. Not available
+    /// for the sequenced reliabilities.
+    bool ack_receipt = false;
 };
 
 /// One connected system, as Peer::connections() lists it.
@@ -136,8 +140,12 @@ public:
         disconnect(remote, mode, ec);
     }
 
-    /// Sends a message, which must start with its message id. Returns the send's receipt number,
-    /// which is never 0.
+    /// Sends a message, which must start with its message id; ids the protocol reserves for itself
+    /// (see is_reserved()) are rejected with Errc::reserved_message_id. Returns the send's receipt
+    /// number, which is never 0: every accepted send takes the next one, whether or not acknowledgement
+    /// was requested. With SendOptions::ack_receipt, a receipt Packet carrying that number reports the
+    /// outcome: [id::snd_receipt_acked or id::snd_receipt_loss][uint32 number], the number in host byte
+    /// order as RakNet writes it (receipt_number() reads it).
     std::uint32_t send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec);
     std::uint32_t send(const Remote& to, ByteView data, const SendOptions& options = SendOptions())
     {
@@ -238,6 +246,29 @@ public:
         std::error_code ec;
         set_incoming_password(password, ec);
         detail::throw_if(ec, "Peer::set_incoming_password");
+    }
+
+    /// Sends a message to every connected system except `exclude`, as send() does. All copies share one
+    /// receipt number; with acknowledgement, each system's copy reports on its own receipt Packet.
+    std::uint32_t broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
+                            std::error_code& ec);
+    std::uint32_t broadcast(ByteView data, const SendOptions& options = SendOptions(),
+                            const std::optional<Remote>& exclude = std::nullopt)
+    {
+        std::error_code ec;
+        const std::uint32_t receipt = broadcast(data, options, exclude, ec);
+        detail::throw_if(ec, "Peer::broadcast");
+        return receipt;
+    }
+    std::uint32_t broadcast(const BitStreamWriter& message, const SendOptions& options,
+                            const std::optional<Remote>& exclude, std::error_code& ec)
+    {
+        return broadcast(message.data(), options, exclude, ec);
+    }
+    std::uint32_t broadcast(const BitStreamWriter& message, const SendOptions& options = SendOptions(),
+                            const std::optional<Remote>& exclude = std::nullopt)
+    {
+        return broadcast(message.data(), options, exclude);
     }
 
     /// The next Packet, if any. Never blocks.

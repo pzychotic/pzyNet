@@ -495,3 +495,104 @@ TEST_CASE("Peer: advertisements reach a RakPeer and arrive from one", "[interop]
     CHECK(packet.address == f.rak_endpoint());
     CHECK(f.peer.connections().empty());
 }
+
+namespace
+{
+
+/// One send of the receipt scenarios, in both libraries' terms.
+struct ReceiptSend
+{
+    transport::Reliability reliability;
+    bool ack_receipt;
+    PacketReliability rak_reliability;
+};
+
+const ReceiptSend receipt_sends[] = {
+    {transport::Reliability::reliable_ordered, true, RELIABLE_ORDERED_WITH_ACK_RECEIPT},
+    {transport::Reliability::unreliable, false, UNRELIABLE},
+    {transport::Reliability::unreliable, true, UNRELIABLE_WITH_ACK_RECEIPT},
+    {transport::Reliability::reliable_sequenced, false, RELIABLE_SEQUENCED},
+    {transport::Reliability::reliable, true, RELIABLE_WITH_ACK_RECEIPT},
+};
+
+std::uint32_t send_from_peer(Fixture& f, const ReceiptSend& send)
+{
+    rn::SendOptions options;
+    options.reliability = send.reliability;
+    options.ack_receipt = send.ack_receipt;
+    return f.peer.send(f.rak_guid(), Bytes{rn::id::user_packet_enum, 7}, options);
+}
+
+std::uint32_t send_from_rakpeer(Fixture& f, const ReceiptSend& send)
+{
+    const char data[] = {static_cast<char>(ID_USER_PACKET_ENUM), 7};
+    return f.rak->Send(data, 2, HIGH_PRIORITY, send.rak_reliability, 0, f.peer_address, false);
+}
+
+/// The receipt Packets' bytes, sorted (acknowledgements need not arrive in send order).
+std::vector<Bytes> peer_receipts(const Fixture& f)
+{
+    std::vector<Bytes> result;
+    for (const rn::Packet& packet : f.peer_packets)
+        if (packet.id == rn::id::snd_receipt_acked || packet.id == rn::id::snd_receipt_loss)
+            result.push_back(packet.data);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+std::vector<Bytes> rak_receipts(const Fixture& f)
+{
+    std::vector<Bytes> result;
+    for (const RakPacket& packet : f.rak_packets)
+        if (packet.id == ID_SND_RECEIPT_ACKED || packet.id == ID_SND_RECEIPT_LOSS)
+            result.push_back(packet.data);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+} // namespace
+
+TEST_CASE("Peer: receipt numbers and acknowledgement Packets match the RakPeer's", "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    Fixture f;
+    f.establish(direction);
+
+    std::vector<std::uint32_t> peer_numbers;
+    std::vector<std::uint32_t> rak_numbers;
+    for (const ReceiptSend& send : receipt_sends)
+    {
+        peer_numbers.push_back(send_from_peer(f, send));
+        rak_numbers.push_back(send_from_rakpeer(f, send));
+    }
+    CHECK(peer_numbers == rak_numbers);
+
+    REQUIRE(f.wait_until([&] { return peer_receipts(f).size() == 3 && rak_receipts(f).size() == 3; }));
+    f.wait_until([] { return false; }, 300ms); // nothing more may arrive
+    CHECK(peer_receipts(f) == rak_receipts(f));
+    CHECK(f.peer_count(rn::id::snd_receipt_acked) == 3);
+    CHECK(f.peer_last(rn::id::snd_receipt_acked).guid == f.rak_guid());
+    CHECK(f.peer_last(rn::id::snd_receipt_acked).address == f.rak_endpoint());
+}
+
+TEST_CASE("Peer: an unacknowledged unreliable send reports the same loss Packet as the RakPeer's",
+          "[interop][rakpeer]")
+{
+    const ReceiptSend& unreliable = receipt_sends[2];
+
+    Fixture rak_silent;
+    rak_silent.establish(Direction::peer_connects);
+    rak_silent.rak->Shutdown(0);
+    send_from_peer(rak_silent, unreliable);
+    REQUIRE(rak_silent.wait_until([&] { return !peer_receipts(rak_silent).empty(); }));
+
+    Fixture peer_silent;
+    peer_silent.establish(Direction::peer_connects);
+    peer_silent.peer.shutdown();
+    send_from_rakpeer(peer_silent, unreliable);
+    REQUIRE(peer_silent.wait_until([&] { return !rak_receipts(peer_silent).empty(); }));
+
+    CHECK(peer_receipts(rak_silent).front().front() == rn::id::snd_receipt_loss);
+    CHECK(peer_receipts(rak_silent) == rak_receipts(peer_silent));
+}

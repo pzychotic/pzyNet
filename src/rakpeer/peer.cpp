@@ -5,8 +5,10 @@
 #include "pzynet/transport/udp_host.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace pzynet
 {
@@ -36,6 +38,30 @@ std::uint8_t failure_id(transport::ConnectFailure reason) noexcept
     return id::connection_attempt_failed;
 }
 
+/// The checks send() and broadcast() make before taking a receipt number.
+std::error_code check(ByteView data, const SendOptions& options) noexcept
+{
+    using transport::Reliability;
+    if (data.empty())
+        return make_error_code(Errc::invalid_argument);
+    if (is_reserved(data[0]))
+        return make_error_code(Errc::reserved_message_id);
+    if (options.ack_receipt && (options.reliability == Reliability::unreliable_sequenced ||
+                                options.reliability == Reliability::reliable_sequenced))
+        return make_error_code(Errc::invalid_argument); // RakNet has no sequenced reliability with receipt
+    return std::error_code();
+}
+
+transport::SendOptions transport_options(const SendOptions& options, std::uint32_t receipt) noexcept
+{
+    transport::SendOptions result;
+    result.reliability = options.reliability;
+    result.channel = options.channel;
+    result.priority = options.priority;
+    result.receipt_token = options.ack_receipt ? receipt : 0;
+    return result;
+}
+
 } // namespace
 
 struct Peer::Impl
@@ -60,6 +86,15 @@ struct Peer::Impl
     std::mutex mutex; // guards everything below
     std::map<transport::ConnectionId, Entry> connections;
     std::uint32_t next_receipt = 1;
+
+    /// The next receipt number; 0 is skipped, as in RakPeer. Requires `mutex`.
+    std::uint32_t take_receipt() noexcept
+    {
+        const std::uint32_t receipt = next_receipt++;
+        if (next_receipt == 0)
+            next_receipt = 1;
+        return receipt;
+    }
 
     /// Requires `mutex`.
     transport::ConnectionId find(const Remote& remote) const
@@ -168,9 +203,26 @@ struct Peer::Impl
                 to_local_time(packet, message->connection);
             return packet;
         }
+        if (const auto* receipt = std::get_if<transport::SendReceipt>(&event))
+        {
+            Entry remote;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const auto it = connections.find(receipt->connection);
+                if (it == connections.end()) // closed by this Peer meanwhile
+                    return std::nullopt;
+                remote = it->second;
+            }
+            const std::uint8_t receipt_id = receipt->delivered ? id::snd_receipt_acked : id::snd_receipt_loss;
+            Packet packet = make_packet(receipt_id, remote);
+            const std::uint32_t number = receipt->token;
+            packet.data.resize(1 + sizeof number);
+            std::memcpy(packet.data.data() + 1, &number, sizeof number); // host byte order, as RakNet does
+            return packet;
+        }
         if (const auto* offline = std::get_if<transport::Unconnected>(&event))
             return translate_offline(*offline);
-        return std::nullopt; // receipts are not reported yet
+        return std::nullopt;
     }
 
     /// An offline pong or out-of-band message as RakPeer reports it; nullopt if malformed.
@@ -293,34 +345,23 @@ void Peer::disconnect(const Remote& remote, transport::DisconnectMode mode, std:
 
 std::uint32_t Peer::send(const Remote& to, ByteView data, const SendOptions& options, std::error_code& ec)
 {
-    ec.clear();
-    if (!impl_)
-    {
-        ec = make_error_code(Errc::not_open);
+    ec = impl_ ? check(data, options) : make_error_code(Errc::not_open);
+    if (ec)
         return 0;
-    }
     transport::ConnectionId connection = transport::invalid_connection;
     std::uint32_t receipt = 0;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         connection = impl_->find(to);
         if (connection != transport::invalid_connection)
-        {
-            receipt = impl_->next_receipt++;
-            if (impl_->next_receipt == 0)
-                impl_->next_receipt = 1;
-        }
+            receipt = impl_->take_receipt();
     }
     if (connection == transport::invalid_connection)
     {
         ec = make_error_code(Errc::not_connected);
         return 0;
     }
-    transport::SendOptions transport_options;
-    transport_options.reliability = options.reliability;
-    transport_options.channel = options.channel;
-    transport_options.priority = options.priority;
-    impl_->host.send(connection, data, transport_options, ec);
+    impl_->host.send(connection, data, transport_options(options, receipt), ec);
     return ec ? 0 : receipt;
 }
 
@@ -501,6 +542,37 @@ void Peer::set_incoming_password(ByteView password, std::error_code& ec)
         ec = make_error_code(Errc::invalid_argument);
     else
         impl_->host.with_engine([&](transport::Engine&) { impl_->engine.set_incoming_password(password); });
+}
+
+std::uint32_t Peer::broadcast(ByteView data, const SendOptions& options, const std::optional<Remote>& exclude,
+                              std::error_code& ec)
+{
+    ec = impl_ ? check(data, options) : make_error_code(Errc::not_open);
+    if (ec)
+        return 0;
+    std::vector<transport::ConnectionId> targets;
+    std::uint32_t receipt = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const transport::ConnectionId excluded = exclude ? impl_->find(*exclude) : transport::invalid_connection;
+        for (const auto& entry : impl_->connections)
+            if (entry.first != excluded)
+                targets.push_back(entry.first);
+        receipt = impl_->take_receipt(); // taken even with nobody to send to, as RakPeer does
+    }
+    const transport::SendOptions copy_options = transport_options(options, receipt);
+    for (const transport::ConnectionId connection : targets)
+    {
+        std::error_code send_ec;
+        impl_->host.send(connection, data, copy_options, send_ec);
+        // A system that disconnected meanwhile is skipped; anything else applies to every copy.
+        if (send_ec && send_ec != Errc::unknown_connection && send_ec != Errc::not_connected)
+        {
+            ec = send_ec;
+            return 0;
+        }
+    }
+    return receipt;
 }
 
 std::optional<Packet> Peer::receive()
