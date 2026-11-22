@@ -318,3 +318,92 @@ TEST_CASE("Peer: after shutdown the RakPeer gets no notification and the port is
     again.start(config, ec);
     CHECK_FALSE(ec);
 }
+
+TEST_CASE("Peer: the connection list names the RakPeer by GUID and address", "[interop][rakpeer]")
+{
+    const Direction direction = GENERATE(Direction::peer_connects, Direction::rakpeer_connects);
+    INFO(name(direction));
+    Fixture f;
+    f.establish(direction);
+
+    const std::vector<rn::RemoteSystem> listed = f.peer.connections();
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].guid == f.rak_guid());
+    CHECK(listed[0].address == f.rak_endpoint());
+    CHECK(listed[0].incoming == (direction == Direction::rakpeer_connects));
+    CHECK(listed[0].mtu == f.rak->GetMTUSize(f.peer_address));
+    CHECK(f.peer.guid_of(f.rak_endpoint()) == f.rak_guid());
+    CHECK(f.peer.address_of(f.rak_guid()) == f.rak_endpoint());
+    CHECK(f.rak->GetGuidFromSystemAddress(f.peer_address).g == f.peer.guid().value);
+
+    f.rak->CloseConnection(f.peer_address, true);
+    REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::disconnection_notification) == 1; }));
+    CHECK(f.peer.connections().empty());
+    CHECK_FALSE(f.peer.guid_of(f.rak_endpoint()));
+}
+
+TEST_CASE("Peer: a RakPeer's offline ping gets the configured response", "[interop][rakpeer]")
+{
+    Fixture f;
+    const Bytes response{'p', 'z', 'y'};
+    f.peer.set_offline_ping_response(response);
+
+    REQUIRE(f.rak->Ping("127.0.0.1", f.peer.local_endpoint().port(), false));
+    REQUIRE(f.wait_until([&] { return f.rak_count(ID_UNCONNECTED_PONG) == 1; }));
+    const RakPacket& pong = f.rak_last(ID_UNCONNECTED_PONG);
+    CHECK(pong.guid.g == f.peer.guid().value);
+    CHECK(pong.address.GetPort() == f.peer.local_endpoint().port());
+    REQUIRE(pong.data.size() == 1 + 4 + response.size()); // [id][RakNet::TimeMS][response]
+    CHECK(Bytes(pong.data.begin() + 5, pong.data.end()) == response);
+
+    // Only systems that accept connections answer the "open connections" ping.
+    f.peer.set_max_incoming_connections(0);
+    REQUIRE(f.rak->Ping("127.0.0.1", f.peer.local_endpoint().port(), true));
+    f.wait_until([] { return false; }, 300ms);
+    CHECK(f.rak_count(ID_UNCONNECTED_PONG) == 1);
+    f.peer.set_max_incoming_connections(1);
+    REQUIRE(f.rak->Ping("127.0.0.1", f.peer.local_endpoint().port(), true));
+    REQUIRE(f.wait_until([&] { return f.rak_count(ID_UNCONNECTED_PONG) == 2; }));
+}
+
+TEST_CASE("Peer: pinging a RakPeer yields its pong as a Packet", "[interop][rakpeer]")
+{
+    Fixture f;
+    const char response[] = "raknet";
+    f.rak->SetOfflinePingResponse(response, 6);
+
+    f.peer.ping(f.rak_endpoint());
+    REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::unconnected_pong) == 1; }));
+    const rn::Packet& pong = f.peer_last(rn::id::unconnected_pong);
+    CHECK(pong.guid == f.rak_guid());
+    CHECK(pong.address == f.rak_endpoint());
+    REQUIRE(pong.data.size() == 1 + 4 + 6);
+    CHECK(Bytes(pong.data.begin() + 5, pong.data.end()) == Bytes(response, response + 6));
+
+    f.rak->SetMaximumIncomingConnections(0);
+    f.peer.ping(f.rak_endpoint(), true);
+    f.wait_until([] { return false; }, 300ms);
+    CHECK(f.peer_count(rn::id::unconnected_pong) == 1);
+}
+
+TEST_CASE("Peer: advertisements reach a RakPeer and arrive from one", "[interop][rakpeer]")
+{
+    Fixture f;
+
+    const Bytes ours{1, 2, 3, 4};
+    f.peer.advertise(f.rak_endpoint(), ours);
+    REQUIRE(f.wait_until([&] { return f.rak_count(ID_ADVERTISE_SYSTEM) == 1; }));
+    const RakPacket& received = f.rak_last(ID_ADVERTISE_SYSTEM);
+    CHECK(received.data == Bytes{ID_ADVERTISE_SYSTEM, 1, 2, 3, 4});
+    CHECK(received.guid.g == f.peer.guid().value);
+    CHECK(received.address.GetPort() == f.peer.local_endpoint().port());
+
+    const char theirs[] = {9, 8, 7};
+    REQUIRE(f.rak->AdvertiseSystem("127.0.0.1", f.peer.local_endpoint().port(), theirs, 3));
+    REQUIRE(f.wait_until([&] { return f.peer_count(rn::id::advertise_system) == 1; }));
+    const rn::Packet& packet = f.peer_last(rn::id::advertise_system);
+    CHECK(packet.data == Bytes{rn::id::advertise_system, 9, 8, 7});
+    CHECK(packet.guid == f.rak_guid());
+    CHECK(packet.address == f.rak_endpoint());
+    CHECK(f.peer.connections().empty());
+}
