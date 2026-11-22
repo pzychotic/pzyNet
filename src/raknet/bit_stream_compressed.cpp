@@ -5,6 +5,7 @@
 #include "pzynet/raknet/bit_stream.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 
 namespace pzynet
@@ -44,9 +45,12 @@ double expand_unit_double(std::uint32_t value) noexcept
 namespace
 {
 
-// The value's `width` bytes in the stream's byte order.
-void stream_bytes(std::uint64_t value, std::size_t width, ByteOrder order, std::uint8_t* out) noexcept
+// The value's `width` bytes in the stream's byte order. `width` is at most 8; the explicit
+// bound also keeps gcc's -Wstringop-overflow from assuming a larger write.
+void stream_bytes(std::uint64_t value, std::size_t width, ByteOrder order, std::uint8_t (&out)[8]) noexcept
 {
+    assert(width >= 1 && width <= sizeof(out));
+    width = std::min(width, sizeof(out));
     for (std::size_t i = 0; i < width; ++i)
     {
         const std::size_t byte = order == ByteOrder::big_endian ? width - 1 - i : i;
@@ -54,8 +58,10 @@ void stream_bytes(std::uint64_t value, std::size_t width, ByteOrder order, std::
     }
 }
 
-std::uint64_t value_of_stream_bytes(const std::uint8_t* bytes, std::size_t width, ByteOrder order) noexcept
+std::uint64_t value_of_stream_bytes(const std::uint8_t (&bytes)[8], std::size_t width, ByteOrder order) noexcept
 {
+    assert(width >= 1 && width <= sizeof(bytes));
+    width = std::min(width, sizeof(bytes));
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < width; ++i)
     {
@@ -71,6 +77,7 @@ std::uint64_t value_of_stream_bytes(const std::uint8_t* bytes, std::size_t width
 void BitStreamWriter::write_compressed_integer(std::uint64_t value, std::size_t width)
 {
     std::uint8_t bytes[8];
+    width = std::clamp<std::size_t>(width, 1, sizeof(bytes));
     stream_bytes(value, width, order_, bytes);
     for (std::size_t last = width - 1; last > 0; --last)
     {
@@ -106,6 +113,7 @@ void BitStreamWriter::write_float16(float value, float min, float max)
 std::uint64_t BitStreamReader::read_compressed_integer(std::size_t width)
 {
     std::uint8_t bytes[8] = {};
+    width = std::clamp<std::size_t>(width, 1, sizeof(bytes));
     std::size_t last = width - 1;
     for (; last > 0; --last)
     {
