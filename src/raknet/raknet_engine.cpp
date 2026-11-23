@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <deque>
 #include <random>
+#include <string>
 #include <unordered_map>
 
 namespace pzynet
@@ -63,6 +64,12 @@ struct Connection
     std::vector<transport::Message> early;
 
     std::optional<std::chrono::milliseconds> clock_offset;
+
+    // application messages, for ConnectionStats
+    std::uint64_t messages_sent = 0;
+    std::uint64_t messages_received = 0;
+    std::chrono::milliseconds timeout{0};
+    std::optional<Endpoint> external_address; // ours, as the remote reported it in the handshake
 };
 
 std::uint64_t random_guid()
@@ -74,29 +81,35 @@ std::uint64_t random_guid()
     return value;
 }
 
-/// Ids this layer interprets itself; an application payload must not start with one of them.
-bool is_reserved(std::uint8_t message_id) noexcept
-{
-    switch (message_id)
-    {
-    case id::connected_ping:
-    case id::connected_pong:
-    case id::detect_lost_connections:
-    case id::connection_request:
-    case id::connection_request_accepted:
-    case id::new_incoming_connection:
-    case id::disconnection_notification:
-    case id::invalid_password:
-        return true;
-    default:
-        return false;
-    }
-}
-
 std::uint16_t clamp_mtu(std::size_t mtu) noexcept
 {
     return static_cast<std::uint16_t>(
         std::min<std::size_t>(std::max<std::size_t>(mtu, wire::minimum_mtu), wire::maximum_mtu));
+}
+
+constexpr std::size_t maximum_ban_length = 15; // a dotted IPv4 address, as RakNet allows
+
+struct Ban
+{
+    std::string address;
+    std::optional<TimePoint> expiry; // nullopt = permanent
+};
+
+/// RakNet's IsBanned matching: equal strings match, and a '*' in the ban matches whatever follows.
+bool ban_matches(std::string_view ban, std::string_view address) noexcept
+{
+    for (std::size_t i = 0;; ++i)
+    {
+        const char b = i < ban.size() ? ban[i] : '\0';
+        const char a = i < address.size() ? address[i] : '\0';
+        if (b == a)
+        {
+            if (a == '\0')
+                return true;
+            continue;
+        }
+        return b == '*' && a != '\0';
+    }
 }
 
 template <class T>
@@ -123,8 +136,57 @@ struct RakNetEngine::Impl
     std::vector<Bytes> scratch;
     // Pings are stamped with the send time, so they wait for the next advance() to learn it.
     std::vector<std::pair<Endpoint, bool>> pending_pings;
+    std::vector<Ban> bans;
+    // Our address as the first completed handshake reported it (RakNet's firstExternalID).
+    std::optional<IpAddress> external_ip;
+
+    void learn_external_address(const Endpoint& address)
+    {
+        if (!external_ip)
+            external_ip = address.address();
+    }
+
+    /// RakNet's reconnect limit: a connection from this IP was set up less than 100 ms ago.
+    bool connected_recently(const IpAddress& address) const
+    {
+        // RakNet's IsLoopbackAddressInCycle: this host's own addresses are exempt.
+        if (!config.limit_ip_connection_frequency || address == external_ip ||
+            std::find(config.local_addresses.begin(), config.local_addresses.end(), address) !=
+                config.local_addresses.end())
+            return false;
+        constexpr std::chrono::milliseconds window{100};
+        return std::any_of(by_endpoint.begin(), by_endpoint.end(), [&](const auto& entry) {
+            const Connection& other = *entry.second;
+            return other.state != State::dead && other.state != State::requesting &&
+                   other.remote.address() == address && now >= other.created && now - other.created < window;
+        });
+    }
 
     std::uint64_t now_ms() const noexcept { return RakNetEngine::wire_time(now); }
+
+    bool is_banned(std::string_view address, TimePoint at) const
+    {
+        return std::any_of(bans.begin(), bans.end(), [&](const Ban& ban) {
+            return (!ban.expiry || *ban.expiry >= at) && ban_matches(ban.address, address);
+        });
+    }
+
+    /// RakNet's ban check, which runs before anything else for every datagram.
+    bool refuse_if_banned(const Endpoint& from)
+    {
+        if (bans.empty())
+            return false;
+        bans.erase(std::remove_if(bans.begin(), bans.end(),
+                                  [&](const Ban& ban) { return ban.expiry && *ban.expiry < now; }),
+                   bans.end());
+        if (!is_banned(from.address().to_string(), now))
+            return false;
+        wire::Rejection rejection;
+        rejection.id = id::connection_banned;
+        rejection.guid = config.guid;
+        transmit(from, wire::encode(rejection));
+        return true;
+    }
 
     void transmit(const Endpoint& to, Bytes data, bool dont_fragment = false)
     {
@@ -150,6 +212,7 @@ struct RakNetEngine::Impl
         connection->remote = remote;
         connection->incoming = incoming;
         connection->created = now;
+        connection->timeout = config.timeout;
         Connection& reference = *connection;
         by_id[reference.id] = &reference;
         by_endpoint[remote] = std::move(connection);
@@ -169,7 +232,7 @@ struct RakNetEngine::Impl
     {
         detail::SessionConfig session_config;
         session_config.mtu = clamp_mtu(mtu);
-        session_config.timeout = config.timeout;
+        session_config.timeout = connection.timeout;
         session_config.max_message_size = config.max_message_size;
         connection.mtu = static_cast<std::uint16_t>(session_config.mtu);
         connection.session = std::make_unique<Session>(session_config, now);
@@ -198,7 +261,7 @@ struct RakNetEngine::Impl
     {
         by_id.erase(connection.id);
         connection.state = State::closing;
-        connection.close_deadline = now + config.timeout;
+        connection.close_deadline = now + connection.timeout;
     }
 
     void fail(Connection& connection, ConnectFailure reason, bool linger = false)
@@ -216,7 +279,10 @@ struct RakNetEngine::Impl
         connection.announced = true;
         events.push_back(transport::Connected{connection.id, connection.remote, connection.incoming});
         for (transport::Message& message : connection.early)
+        {
+            ++connection.messages_received;
             events.push_back(std::move(message));
+        }
         connection.early.clear();
     }
 
@@ -351,7 +417,11 @@ void RakNetEngine::Impl::handle_offline(std::uint8_t message_id, const Endpoint&
         fail(*connection, ConnectFailure::banned);
         return;
     case id::no_free_incoming_connections:
+        fail(*connection, ConnectFailure::no_free_slots);
+        return;
     case id::ip_recently_connected:
+        fail(*connection, ConnectFailure::recently_connected);
+        return;
     case id::connection_attempt_failed:
         fail(*connection, ConnectFailure::connection_refused);
         return;
@@ -408,6 +478,11 @@ void RakNetEngine::Impl::handle_request_2(const Endpoint& from, ByteView data)
     if (incoming_count() >= config.max_incoming_connections || by_endpoint.size() >= config.max_connections)
     {
         reject(id::no_free_incoming_connections);
+        return;
+    }
+    if (connected_recently(from.address()))
+    {
+        reject(id::ip_recently_connected);
         return;
     }
 
@@ -468,7 +543,11 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
         {
             wire::NewIncomingConnection incoming;
             if (wire::decode(payload, incoming))
+            {
                 record_clock(connection, incoming.accept_time, incoming.time);
+                learn_external_address(incoming.server_address);
+                connection.external_address = incoming.server_address;
+            }
             announce(connection);
         }
         else if (message_id == id::connected_ping)
@@ -489,6 +568,8 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
             if (!wire::decode(payload, accepted))
                 return;
             record_clock(connection, accepted.request_time, accepted.accept_time);
+            learn_external_address(accepted.client_address);
+            connection.external_address = accepted.client_address;
 
             wire::NewIncomingConnection reply;
             reply.server_address = connection.remote;
@@ -528,6 +609,7 @@ void RakNetEngine::Impl::on_message(Connection& connection, detail::Delivered& m
         case id::invalid_password:
             return; // stale handshake traffic
         default:
+            ++connection.messages_received;
             events.push_back(
                 transport::Message{connection.id, message.reliability, message.channel, std::move(message.data)});
             return;
@@ -607,7 +689,7 @@ void RakNetEngine::Impl::advance_connection(Connection& connection)
     // Keep-alive: an idle connection gets a reliable ping, so that a dead peer shows up as
     // unacknowledged data and trips the session's time-out.
     if (connection.state == State::connected && !session.has_unacked() &&
-        now - session.last_reliable_send() >= config.timeout / 2)
+        now - session.last_reliable_send() >= connection.timeout / 2)
     {
         wire::ConnectedPing ping;
         ping.time = now_ms();
@@ -664,6 +746,8 @@ void RakNetEngine::handle_datagram(const Endpoint& from, ByteView data, TimePoin
     Impl& impl = *impl_;
     impl.now = now;
     if (data.size() <= 2) // RakNet ignores these too; too short for any message
+        return;
+    if (impl.refuse_if_banned(from))
         return;
 
     if (const std::optional<std::uint8_t> offline = wire::offline_message_id(data))
@@ -742,7 +826,7 @@ std::optional<TimePoint> RakNetEngine::next_deadline() const
         if (connection.state == State::connected)
         {
             if (!session.has_unacked())
-                consider(session.last_reliable_send() + impl.config.timeout / 2);
+                consider(session.last_reliable_send() + connection.timeout / 2);
         }
         else if (connection.state == State::closing)
             consider(session.flushed() && !session.acks_pending() ? TimePoint::min() : connection.close_deadline);
@@ -824,7 +908,11 @@ void RakNetEngine::send(ConnectionId id, ByteView data, const transport::SendOpt
                                             options.reliability == Reliability::reliable_sequenced))
         ec = make_error_code(Errc::invalid_argument); // RakNet has no sequenced + receipt combination
     else
+    {
         ec = connection->session->send(data, options, impl.now);
+        if (!ec)
+            ++connection->messages_sent;
+    }
 }
 
 std::uint64_t RakNetEngine::guid() const noexcept
@@ -835,6 +923,24 @@ std::uint64_t RakNetEngine::guid() const noexcept
 std::size_t RakNetEngine::connection_count() const noexcept
 {
     return impl_->by_id.size();
+}
+
+std::vector<ConnectionId> RakNetEngine::connections() const
+{
+    std::vector<ConnectionId> ids;
+    ids.reserve(impl_->by_id.size());
+    for (const auto& entry : impl_->by_id)
+        ids.push_back(entry.first);
+    return ids;
+}
+
+std::size_t RakNetEngine::closing_count() const noexcept
+{
+    std::size_t count = 0;
+    for (const auto& entry : impl_->by_endpoint)
+        if (entry.second->state == State::closing)
+            ++count;
+    return count;
 }
 
 std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) const
@@ -848,9 +954,61 @@ std::optional<ConnectionInfo> RakNetEngine::connection_info(ConnectionId id) con
     info.mtu = connection->mtu;
     info.incoming = connection->incoming;
     info.clock_offset = connection->clock_offset;
+    info.timeout = connection->timeout;
+    info.external_address = connection->external_address;
     if (connection->session)
         info.rtt = connection->session->rtt();
     return info;
+}
+
+std::optional<ConnectionStats> RakNetEngine::connection_stats(ConnectionId id) const
+{
+    const Connection* connection = impl_->find(id);
+    if (connection == nullptr)
+        return std::nullopt;
+    ConnectionStats stats;
+    stats.messages_sent = connection->messages_sent;
+    stats.messages_received = connection->messages_received;
+    if (const Session* session = connection->session.get())
+    {
+        static_cast<DatagramCounters&>(stats) = session->counters();
+        stats.queued_messages = session->queued_messages();
+        stats.queued_bytes = session->queued_bytes();
+    }
+    return stats;
+}
+
+void RakNetEngine::set_timeout(ConnectionId id, std::chrono::milliseconds timeout, std::error_code& ec)
+{
+    if (timeout.count() <= 0)
+    {
+        ec = make_error_code(Errc::invalid_argument);
+        return;
+    }
+    Connection* connection = impl_->find(id);
+    if (connection == nullptr)
+    {
+        ec = make_error_code(Errc::unknown_connection);
+        return;
+    }
+    ec.clear();
+    connection->timeout = timeout;
+    if (connection->session)
+        connection->session->set_timeout(timeout);
+}
+
+void RakNetEngine::set_timeout(std::chrono::milliseconds timeout)
+{
+    if (timeout.count() <= 0)
+        return;
+    impl_->config.timeout = timeout;
+    for (auto& entry : impl_->by_endpoint)
+    {
+        Connection& connection = *entry.second;
+        connection.timeout = timeout;
+        if (connection.session)
+            connection.session->set_timeout(timeout);
+    }
 }
 
 void RakNetEngine::set_max_incoming_connections(std::size_t count)
@@ -866,6 +1024,54 @@ void RakNetEngine::set_incoming_password(ByteView password)
 void RakNetEngine::set_offline_ping_response(ByteView data)
 {
     impl_->config.offline_ping_response.assign(data.begin(), data.end());
+}
+
+void RakNetEngine::ban(std::string_view address, std::chrono::milliseconds duration, TimePoint now,
+                       std::error_code& ec)
+{
+    ec.clear();
+    if (address.empty() || address.size() > maximum_ban_length)
+    {
+        ec = make_error_code(Errc::invalid_argument);
+        return;
+    }
+    std::optional<TimePoint> expiry;
+    if (duration.count() > 0)
+        expiry = now + duration;
+    std::vector<Ban>& bans = impl_->bans;
+    const auto existing =
+        std::find_if(bans.begin(), bans.end(), [&](const Ban& ban) { return ban.address == address; });
+    if (existing != bans.end())
+        existing->expiry = expiry;
+    else
+        bans.push_back(Ban{std::string(address), expiry});
+}
+
+void RakNetEngine::unban(std::string_view address)
+{
+    std::vector<Ban>& bans = impl_->bans;
+    bans.erase(std::remove_if(bans.begin(), bans.end(), [&](const Ban& ban) { return ban.address == address; }),
+               bans.end());
+}
+
+void RakNetEngine::clear_bans()
+{
+    impl_->bans.clear();
+}
+
+bool RakNetEngine::is_banned(std::string_view address, TimePoint now) const
+{
+    return impl_->is_banned(address, now);
+}
+
+void RakNetEngine::set_limit_ip_connection_frequency(bool limit)
+{
+    impl_->config.limit_ip_connection_frequency = limit;
+}
+
+void RakNetEngine::set_local_addresses(std::vector<IpAddress> addresses)
+{
+    impl_->config.local_addresses = std::move(addresses);
 }
 
 void RakNetEngine::ping(const Endpoint& to, bool only_if_accepting)

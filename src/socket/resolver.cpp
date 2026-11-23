@@ -52,4 +52,20 @@ std::vector<Endpoint> resolve(std::string_view host, std::uint16_t port, Resolve
     return endpoints;
 }
 
+std::vector<IpAddress> host_addresses(std::error_code& ec)
+{
+    detail::ensure_initialized();
+    ec.clear();
+    char name[256] = {};
+    if (::gethostname(name, sizeof name - 1) != 0)
+    {
+        ec = detail::last_socket_error();
+        return {};
+    }
+    std::vector<IpAddress> addresses;
+    for (const Endpoint& endpoint : resolve(name, 0, ResolveFamily::v4, ec))
+        addresses.push_back(endpoint.address());
+    return addresses;
+}
+
 } // namespace pzynet

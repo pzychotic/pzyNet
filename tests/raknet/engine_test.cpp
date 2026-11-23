@@ -9,10 +9,12 @@
 #include "pzynet/raknet/wire.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <utility>
 
 using namespace pzynet;
 using namespace pzynet::raknet;
@@ -48,7 +50,7 @@ std::uint32_t index_of(const Bytes& message)
     return reader.u32_be();
 }
 
-void send(Peer& peer, ConnectionId connection, const Bytes& data,
+void send(Node& node, ConnectionId connection, const Bytes& data,
           Reliability reliability = Reliability::reliable_ordered, std::uint8_t channel = 0,
           std::uint32_t receipt_token = 0)
 {
@@ -57,12 +59,12 @@ void send(Peer& peer, ConnectionId connection, const Bytes& data,
     options.channel = channel;
     options.receipt_token = receipt_token;
     std::error_code ec;
-    peer.engine.send(connection, data, options, ec);
+    node.engine.send(connection, data, options, ec);
     REQUIRE_FALSE(ec);
 }
 
 /// Connects `client` to `server` and returns {client's id, server's id} for the new connection.
-std::pair<ConnectionId, ConnectionId> connect(Network& network, Peer& client, Peer& server, ByteView password = {})
+std::pair<ConnectionId, ConnectionId> connect(Network& network, Node& client, Node& server, ByteView password = {})
 {
     const std::size_t client_before = client.count<Connected>();
     const std::size_t server_before = server.count<Connected>();
@@ -83,8 +85,8 @@ std::pair<ConnectionId, ConnectionId> connect(Network& network, Peer& client, Pe
 struct Session
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     ConnectionId at_client = 0;
     ConnectionId at_server = 0;
 
@@ -103,8 +105,8 @@ struct Session
 TEST_CASE("two engines complete the RakNet handshake", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
 
     std::vector<Network::Datagram> wire;
     network.tap = [&](const Network::Datagram& datagram) { wire.push_back(datagram); };
@@ -182,7 +184,7 @@ TEST_CASE("the first user message is numbered like a stock RakNet client's", "[r
 TEST_CASE("a connection attempt to a silent address fails after the MTU ladder", "[raknet][engine]")
 {
     Network network;
-    Peer& client = network.add();
+    Node& client = network.add();
     std::map<std::size_t, int> probes; // datagram size -> count
     network.tap = [&](const Network::Datagram& datagram) {
         CHECK(datagram.data[0] == id::open_connection_request_1);
@@ -208,8 +210,8 @@ TEST_CASE("the handshake settles on the largest MTU the path carries", "[raknet]
 {
     Network network;
     network.path_mtu = 1300; // 1492-byte probes vanish, 1200-byte ones get through
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     const auto ids = connect(network, client, server);
 
     CHECK(client.engine.connection_info(ids.first)->mtu == 1200);
@@ -231,9 +233,9 @@ TEST_CASE("the password is checked by the server", "[raknet][engine]")
     Network network;
     Config config = server_config();
     config.incoming_password = {'s', 'e', 'c', 'r', 'e', 't'};
-    Peer& server = network.add(config);
-    Peer& wrong = network.add();
-    Peer& right = network.add();
+    Node& server = network.add(config);
+    Node& wrong = network.add();
+    Node& right = network.add();
 
     std::error_code ec;
     const Bytes bad{'g', 'u', 'e', 's', 's'};
@@ -257,10 +259,10 @@ TEST_CASE("connections beyond the incoming limit are refused", "[raknet][engine]
     Network network;
     Config config;
     config.max_incoming_connections = 1;
-    Peer& server = network.add(config);
-    Peer& first = network.add();
-    Peer& second = network.add();
-    Peer& closed = network.add(); // max_incoming_connections = 0: accepts nobody
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    Node& closed = network.add(); // max_incoming_connections = 0: accepts nobody
 
     connect(network, first, server);
 
@@ -268,8 +270,8 @@ TEST_CASE("connections beyond the incoming limit are refused", "[raknet][engine]
     second.engine.connect(server.address, {}, ec);
     first.engine.connect(closed.address, {}, ec);
     REQUIRE(network.run_until([&] { return second.count<ConnectFailed>() == 1 && first.count<ConnectFailed>() == 1; }));
-    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::connection_refused);
-    CHECK(first.all<ConnectFailed>()[0].reason == ConnectFailure::connection_refused);
+    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::no_free_slots);
+    CHECK(first.all<ConnectFailed>()[0].reason == ConnectFailure::no_free_slots);
     CHECK(server.engine.connection_count() == 1);
 
     // Raising the limit at run time lets the next attempt in.
@@ -288,7 +290,7 @@ TEST_CASE("connect reports misuse through the error code", "[raknet][engine]")
 
     Config tiny;
     tiny.max_connections = 1;
-    Peer& limited = s.network.add(tiny);
+    Node& limited = s.network.add(tiny);
     CHECK(limited.engine.connect(s.server.address, {}, ec) != invalid_connection);
     CHECK_FALSE(ec);
     CHECK(limited.engine.connect(s.client.address, {}, ec) == invalid_connection);
@@ -302,7 +304,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("different protocol version")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -315,7 +317,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("server demands transport security")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -331,7 +333,7 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
     SECTION("banned")
     {
         Network network;
-        Peer& client = network.add();
+        Node& client = network.add();
         std::error_code ec;
         client.engine.connect(server, {}, ec);
         network.run(20ms);
@@ -339,12 +341,28 @@ TEST_CASE("handshake replies from an incompatible server fail the attempt", "[ra
         REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }, 1s));
         CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
     }
+    SECTION("each refusal keeps its own reason")
+    {
+        const auto [refusal, reason] = GENERATE(
+            std::make_pair(id::no_free_incoming_connections, ConnectFailure::no_free_slots),
+            std::make_pair(id::ip_recently_connected, ConnectFailure::recently_connected),
+            std::make_pair(id::already_connected, ConnectFailure::already_connected),
+            std::make_pair(id::connection_attempt_failed, ConnectFailure::connection_refused));
+        Network network;
+        Node& client = network.add();
+        std::error_code ec;
+        client.engine.connect(server, {}, ec);
+        network.run(20ms);
+        network.inject(server, client.address, wire::encode(wire::Rejection{refusal, 1}));
+        REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }, 1s));
+        CHECK(client.all<ConnectFailed>()[0].reason == reason);
+    }
 }
 
 TEST_CASE("a client speaking another protocol version is told so", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
+    Node& server = network.add(server_config());
     const Endpoint stranger(IpAddress::v4(10, 9, 9, 9), 1234);
     std::vector<Bytes> replies;
     network.tap = [&](const Network::Datagram& datagram) {
@@ -364,6 +382,244 @@ TEST_CASE("a client speaking another protocol version is told so", "[raknet][eng
     CHECK(reply.protocol == wire::protocol_version);
     CHECK(reply.guid == server.engine.guid());
     CHECK(server.engine.connection_count() == 0);
+}
+
+// --- ban list and reconnect limit ----------------------------------------------------------------
+
+TEST_CASE("a banned address is refused with the connection-banned id", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+    std::vector<Bytes> replies;
+    network.tap = [&](const Network::Datagram& datagram) {
+        if (datagram.to == client.address)
+            replies.push_back(datagram.data);
+    };
+
+    server.engine.ban("10.0.0.2", 0ms, network.now);
+    CHECK(server.engine.is_banned("10.0.0.2", network.now));
+
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+    CHECK(server.engine.connection_count() == 0);
+
+    REQUIRE_FALSE(replies.empty());
+    wire::Rejection rejection;
+    REQUIRE(wire::decode(replies[0], rejection));
+    CHECK(rejection.id == id::connection_banned);
+    CHECK(rejection.guid == server.engine.guid());
+}
+
+TEST_CASE("a ban for a duration expires", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+
+    server.engine.ban("10.0.0.2", 2s, network.now);
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+
+    CHECK(server.engine.is_banned("10.0.0.2", network.now + 1s));
+    network.run(2s);
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now));
+    connect(network, client, server);
+}
+
+TEST_CASE("banning again replaces the duration", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    server.engine.ban("10.0.0.2", 1s, network.now);
+    server.engine.ban("10.0.0.2", 0ms, network.now);
+    CHECK(server.engine.is_banned("10.0.0.2", network.now + 24h));
+    server.engine.ban("10.0.0.2", 1s, network.now);
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now + 2s));
+}
+
+TEST_CASE("unbanning and clearing the ban list let a client in again", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+    server.engine.ban("10.0.0.2", 0ms, network.now);
+    server.engine.ban("10.0.0.3", 0ms, network.now);
+
+    SECTION("unban")
+    {
+        server.engine.unban("10.0.0.2");
+        CHECK(server.engine.is_banned("10.0.0.3", network.now));
+    }
+    SECTION("clear")
+    {
+        server.engine.clear_bans();
+        CHECK_FALSE(server.engine.is_banned("10.0.0.3", network.now));
+    }
+    CHECK_FALSE(server.engine.is_banned("10.0.0.2", network.now));
+    connect(network, client, server);
+}
+
+TEST_CASE("ban entries match like RakNet's", "[raknet][engine][ban]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    RakNetEngine& engine = server.engine;
+    const TimePoint now = network.now;
+
+    engine.ban("10.0.0.2", 0ms, now);
+    CHECK(engine.is_banned("10.0.0.2", now));
+    CHECK_FALSE(engine.is_banned("10.0.0.20", now)); // no prefix match without a wildcard
+    CHECK_FALSE(engine.is_banned("10.0.0.", now));
+
+    engine.ban("192.168.*", 0ms, now);
+    CHECK(engine.is_banned("192.168.1.7", now));
+    CHECK(engine.is_banned("192.168.250.250", now));
+    CHECK_FALSE(engine.is_banned("192.169.1.7", now));
+
+    engine.unban("192.168"); // only the exact entry is removed
+    CHECK(engine.is_banned("192.168.1.7", now));
+
+    std::error_code misuse;
+    engine.ban("", 0ms, now, misuse);
+    CHECK(misuse == Errc::invalid_argument);
+    engine.ban("1234:5678:9abc::1", 0ms, now, misuse); // longer than a dotted IPv4 address
+    CHECK(misuse == Errc::invalid_argument);
+    CHECK_THROWS_AS(engine.ban("", 0ms, now), std::system_error);
+    engine.ban("10.0.0.9", 0ms, now, misuse);
+    CHECK_FALSE(misuse);
+
+    Node& client = network.add(); // 10.0.0.2 via the wildcard
+    engine.ban("10.0.*", 0ms, now);
+    engine.unban("10.0.0.2");
+    std::error_code ec;
+    client.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return client.count<ConnectFailed>() == 1; }));
+    CHECK(client.all<ConnectFailed>()[0].reason == ConnectFailure::banned);
+}
+
+TEST_CASE("a connection from a newly banned address times out", "[raknet][engine][ban]")
+{
+    Session s;
+    s.server.engine.ban("10.0.0.2", 0ms, s.network.now);
+    send(s.client, s.at_client, user_message(1));
+    REQUIRE(s.network.run_until([&] { return s.server.count<Disconnected>() == 1; }, 30s));
+    CHECK(s.server.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+    CHECK(s.server.count<Message>() == 0);
+    REQUIRE(s.network.run_until([&] { return s.client.count<Disconnected>() == 1; }, 30s));
+    CHECK(s.client.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+}
+
+TEST_CASE("the reconnect limit refuses an IP that connects again within 100 ms", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    second.address = Endpoint(first.address.address(), 60001); // same IP, another port
+    std::vector<Bytes> replies;
+    network.tap = [&](const Network::Datagram& datagram) {
+        if (datagram.to == second.address && datagram.data[0] == id::ip_recently_connected)
+            replies.push_back(datagram.data);
+    };
+
+    std::error_code ec;
+    first.engine.connect(server.address, {}, ec);
+    network.run(1ms);
+    second.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return second.count<ConnectFailed>() == 1; }, 1s));
+    CHECK(second.all<ConnectFailed>()[0].reason == ConnectFailure::recently_connected);
+    REQUIRE(replies.size() == 1);
+    wire::Rejection rejection;
+    REQUIRE(wire::decode(replies[0], rejection));
+    CHECK(rejection.guid == server.engine.guid());
+    REQUIRE(network.run_until([&] { return first.count<Connected>() == 1; }));
+
+    // Once the window has passed, the same IP is welcome again.
+    network.run(100ms);
+    connect(network, second, server);
+    CHECK(server.engine.connection_count() == 2);
+}
+
+TEST_CASE("without the reconnect limit an IP may connect again at once", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& first = network.add();
+    Node& second = network.add();
+    second.address = Endpoint(first.address.address(), 60001);
+
+    std::error_code ec;
+    first.engine.connect(server.address, {}, ec);
+    network.run(1ms);
+    second.engine.connect(server.address, {}, ec);
+    REQUIRE(network.run_until([&] { return server.count<Connected>() == 2; }, 1s));
+    CHECK(second.count<ConnectFailed>() == 0);
+}
+
+TEST_CASE("the reconnect limit does not apply to the engine's own IP", "[raknet][engine][reconnect]")
+{
+    // RakNet exempts its own addresses, among them the external address the first completed
+    // handshake reported. Here the server sees itself as 10.0.0.1, the IP these clients share.
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(server.address.address(), 60001);
+    second.address = Endpoint(server.address.address(), 60002);
+
+    const TimePoint start = network.now;
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(network.now - start < 100ms); // the second attempt came within the window
+}
+
+TEST_CASE("the reconnect limit does not apply to the host's other local addresses",
+          "[raknet][engine][reconnect]")
+{
+    // RakNet also exempts every address of the host's interfaces (its internal IDs), not just the
+    // external one. The engine learns them from its driver.
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    const IpAddress other_interface = IpAddress::v4(10, 0, 0, 77);
+    config.local_addresses = {other_interface};
+    Node& server = network.add(config);
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(other_interface, 60001);
+    second.address = Endpoint(other_interface, 60002);
+
+    const TimePoint start = network.now;
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(network.now - start < 100ms);
+}
+
+TEST_CASE("local addresses can be replaced after construction", "[raknet][engine][reconnect]")
+{
+    Network network;
+    Config config = server_config();
+    config.limit_ip_connection_frequency = true;
+    Node& server = network.add(config);
+    const IpAddress other_interface = IpAddress::v4(10, 0, 0, 78);
+    server.engine.set_local_addresses({other_interface});
+    Node& first = network.add();
+    Node& second = network.add();
+    first.address = Endpoint(other_interface, 60001);
+    second.address = Endpoint(other_interface, 60002);
+
+    connect(network, first, server);
+    connect(network, second, server);
+    CHECK(server.engine.connection_count() == 2);
 }
 
 // --- delivering ----------------------------------------------------------------------------------
@@ -546,8 +802,8 @@ TEST_CASE("messages larger than the configured limit are refused", "[raknet][eng
     Network network;
     Config config = server_config();
     config.max_message_size = 10'000;
-    Peer& server = network.add(config);
-    Peer& client = network.add(config);
+    Node& server = network.add(config);
+    Node& client = network.add(config);
     const auto ids = connect(network, client, server);
 
     SendOptions options;
@@ -612,7 +868,7 @@ TEST_CASE("send rejects invalid requests", "[raknet][engine]")
     CHECK(ec == make_error_code(Errc::invalid_argument));
 
     // Not established yet.
-    Peer& late = s.network.add();
+    Node& late = s.network.add();
     const ConnectionId pending = late.engine.connect(s.server.address, {}, ec);
     REQUIRE_FALSE(ec);
     late.engine.send(pending, user_message(1), SendOptions(), ec);
@@ -687,6 +943,81 @@ TEST_CASE("a silent peer is detected by time-out", "[raknet][engine]")
     CHECK(s.server.engine.connection_count() == 0);
 }
 
+TEST_CASE("a connection with a shorter time-out drops while others survive the same stall", "[raknet][engine]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& impatient = network.add();
+    Node& patient = network.add();
+    const auto short_lived = connect(network, impatient, server);
+    const auto long_lived = connect(network, patient, server);
+
+    std::error_code ec;
+    server.engine.set_timeout(short_lived.second, 2s, ec);
+    REQUIRE_FALSE(ec);
+    CHECK(server.engine.connection_info(short_lived.second)->timeout == 2s);
+    CHECK(server.engine.connection_info(long_lived.second)->timeout == 10s);
+
+    network.run(1s);
+    network.loss = 1.0; // every connection stalls
+    const TimePoint cut = network.now;
+    REQUIRE(network.run_until([&] { return server.count<Disconnected>() == 1; }, 20s));
+    CHECK(network.now - cut <= 4s); // within keep-alive interval (timeout/2) plus the timeout
+    CHECK(server.all<Disconnected>()[0].connection == short_lived.second);
+    CHECK(server.all<Disconnected>()[0].reason == DisconnectReason::timed_out);
+
+    // Long after the impatient connection gave up, the patient one rides out the stall.
+    network.run(4s);
+    network.loss = 0.0;
+    CHECK(server.count<Disconnected>() == 1);
+    send(patient, long_lived.first, user_message(1));
+    REQUIRE(network.run_until([&] { return server.count<Message>() == 1; }));
+    CHECK(server.all<Message>()[0].connection == long_lived.second);
+}
+
+TEST_CASE("the time-out can be changed for every connection at once", "[raknet][engine]")
+{
+    Session s;
+    s.server.engine.set_timeout(s.at_server, 30s);
+    s.server.engine.set_timeout(3s); // like RakNet's SetTimeoutTime with UNASSIGNED_SYSTEM_ADDRESS
+    CHECK(s.server.engine.connection_info(s.at_server)->timeout == 3s);
+
+    Node& late = s.network.add();
+    const auto ids = connect(s.network, late, s.server);
+    CHECK(s.server.engine.connection_info(ids.second)->timeout == 3s);
+}
+
+TEST_CASE("set_timeout rejects unknown connections and non-positive durations", "[raknet][engine]")
+{
+    Session s;
+    std::error_code ec;
+    s.server.engine.set_timeout(ConnectionId(9999), 1s, ec);
+    CHECK(ec == Errc::unknown_connection);
+    s.server.engine.set_timeout(s.at_server, 0ms, ec);
+    CHECK(ec == Errc::invalid_argument);
+    CHECK(s.server.engine.connection_info(s.at_server)->timeout == 10s);
+}
+
+TEST_CASE("each side learns its external address from the handshake", "[raknet][engine]")
+{
+    Network network;
+    Node& server = network.add(server_config());
+    Node& client = network.add();
+
+    std::error_code ec;
+    const ConnectionId pending = client.engine.connect(server.address, {}, ec);
+    REQUIRE_FALSE(ec);
+    CHECK_FALSE(client.engine.connection_info(pending)->external_address);
+
+    REQUIRE(network.run_until([&] { return client.count<Connected>() == 1 && server.count<Connected>() == 1; }));
+    const auto client_info = client.engine.connection_info(pending);
+    const auto server_info = server.engine.connection_info(server.all<Connected>()[0].connection);
+    REQUIRE(client_info->external_address);
+    REQUIRE(server_info->external_address);
+    CHECK(*client_info->external_address == client.address);
+    CHECK(*server_info->external_address == server.address);
+}
+
 TEST_CASE("an abrupt disconnect leaves the peer to time out", "[raknet][engine]")
 {
     Session s;
@@ -714,8 +1045,8 @@ TEST_CASE("an idle connection stays alive on keep-alives", "[raknet][engine]")
 TEST_CASE("next_deadline reflects pending work", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
-    Peer& client = network.add();
+    Node& server = network.add(server_config());
+    Node& client = network.add();
     CHECK_FALSE(client.engine.next_deadline()); // nothing to do
 
     const auto ids = connect(network, client, server);
@@ -736,9 +1067,9 @@ TEST_CASE("unconnected pings are answered with the offline response", "[raknet][
     Network network;
     Config config = server_config();
     config.offline_ping_response = {'m', 'o', 't', 'd'};
-    Peer& server = network.add(config);
-    Peer& closed = network.add(); // accepts no connections
-    Peer& client = network.add();
+    Node& server = network.add(config);
+    Node& closed = network.add(); // accepts no connections
+    Node& client = network.add();
 
     client.engine.ping(server.address);
     client.engine.ping(closed.address, true); // "only if accepting": stays unanswered
@@ -765,8 +1096,8 @@ TEST_CASE("unconnected pings are answered with the offline response", "[raknet][
 TEST_CASE("advertise reaches a peer without a connection", "[raknet][engine]")
 {
     Network network;
-    Peer& a = network.add();
-    Peer& b = network.add();
+    Node& a = network.add();
+    Node& b = network.add();
 
     std::error_code ec;
     a.engine.advertise(b.address, Bytes{'h', 'e', 'y'}, ec);
@@ -857,8 +1188,8 @@ TEST_CASE("a sender that never completes its split messages cannot exhaust memor
     Network network;
     Config config = server_config();
     config.max_message_size = 64 * 1024;
-    Peer& server = network.add(config);
-    Peer& client = network.add();
+    Node& server = network.add(config);
+    Node& client = network.add();
     connect(network, client, server);
 
     // Open ever more split messages, one small chunk each, and never finish any of them.
@@ -889,7 +1220,7 @@ TEST_CASE("a sender that never completes its split messages cannot exhaust memor
 TEST_CASE("an unverified peer must present a connection request first", "[raknet][engine]")
 {
     Network network;
-    Peer& server = network.add(server_config());
+    Node& server = network.add(server_config());
     const Endpoint stranger(IpAddress::v4(10, 9, 9, 9), 1234);
     std::vector<Bytes> replies;
     network.tap = [&](const Network::Datagram& datagram) {

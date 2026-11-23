@@ -66,10 +66,18 @@ target_link_libraries(pzynet_transport PUBLIC pzynet::core pzynet::socket Thread
 # --- raknet: RakNet 4.x wire protocol as a sans-I/O engine ---------------------------------------------
 # Needs only the *headers* of the transport layer (the Engine interface); it never touches a socket.
 pzynet_add_library(raknet STATIC
+    src/raknet/bit_stream.cpp
+    src/raknet/bit_stream_compressed.cpp
+    src/raknet/bit_stream_types.cpp
     src/raknet/wire.cpp
     src/raknet/session.cpp
     src/raknet/raknet_engine.cpp)
 target_link_libraries(pzynet_raknet PUBLIC pzynet::core)
+
+# --- rakpeer: RakNet-style Peer (socket + engine + background thread) on top of raknet --------------------
+pzynet_add_library(rakpeer STATIC
+    src/rakpeer/peer.cpp)
+target_link_libraries(pzynet_rakpeer PUBLIC pzynet::raknet pzynet::transport pzynet::socket)
 
 if(PZYNET_BUILD_TESTS)
     enable_testing()
@@ -84,7 +92,7 @@ if(PZYNET_INSTALL)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
 
-    install(TARGETS pzynet_core pzynet_socket pzynet_transport pzynet_raknet
+    install(TARGETS pzynet_core pzynet_socket pzynet_transport pzynet_raknet pzynet_rakpeer
         EXPORT pzynetTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

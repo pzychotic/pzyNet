@@ -30,6 +30,15 @@ TEST_CASE("localhost resolves to a loopback address", "[socket][resolver]")
     }));
 }
 
+TEST_CASE("the host's own addresses are IPv4 addresses", "[socket][resolver]")
+{
+    std::error_code ec;
+    const std::vector<IpAddress> addresses = host_addresses(ec);
+    REQUIRE_FALSE(ec);
+    CHECK_FALSE(addresses.empty());
+    CHECK(std::all_of(addresses.begin(), addresses.end(), [](const IpAddress& a) { return a.is_v4(); }));
+}
+
 TEST_CASE("an unknown host reports host_not_found", "[socket][resolver]")
 {
     // ".invalid" is reserved (RFC 2606) and never resolves.

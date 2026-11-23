@@ -33,6 +33,8 @@ _Avoid_: Buffer, serializer
 A RakNet-style endpoint that owns a socket and a RakNet engine and offers RakNet's application-level
 behaviour.
 _Avoid_: RakPeer, host (the transport-level driver is the host)
+(`rakpeer` is only the name of the library target and directory that hold the Peer, per ADR-0002; the
+domain term and the type stay "Peer".)
 
 **Message id**:
 The first byte of every RakNet message, naming what the rest of it means; ids below 134 belong to

@@ -19,9 +19,9 @@ namespace test
 using Bytes = std::vector<std::uint8_t>;
 using namespace std::chrono_literals;
 
-struct Peer
+struct Node
 {
-    Peer(pzynet::raknet::Config config, const pzynet::Endpoint& address_) : engine(std::move(config)), address(address_)
+    Node(pzynet::raknet::Config config, const pzynet::Endpoint& address_) : engine(std::move(config)), address(address_)
     {
     }
 
@@ -71,18 +71,20 @@ public:
 
     /// Sees every datagram put on the wire, before the link properties apply.
     std::function<void(const Datagram&)> tap;
+    /// Loses the datagrams it returns true for (after tap, before the link properties apply).
+    std::function<bool(const Datagram&)> drop;
 
     pzynet::TimePoint now = pzynet::TimePoint() + std::chrono::hours(1);
     std::size_t datagrams_sent = 0;
 
-    Peer& add(pzynet::raknet::Config config = {})
+    Node& add(pzynet::raknet::Config config = {})
     {
-        const auto index = static_cast<std::uint8_t>(peers_.size() + 1);
+        const auto index = static_cast<std::uint8_t>(nodes_.size() + 1);
         if (config.guid == 0)
             config.guid = 0x1000u + index; // deterministic
-        peers_.push_back(std::make_unique<Peer>(std::move(config),
+        nodes_.push_back(std::make_unique<Node>(std::move(config),
                                                 pzynet::Endpoint(pzynet::IpAddress::v4(10, 0, 0, index), 60000)));
-        return *peers_.back();
+        return *nodes_.back();
     }
 
     /// Puts a hand-made datagram on the wire as if `from` had sent it.
@@ -99,22 +101,24 @@ public:
         {
             const Datagram datagram = std::move(in_flight_.begin()->second);
             in_flight_.erase(in_flight_.begin());
-            for (auto& peer : peers_)
-                if (peer->address == datagram.to)
-                    peer->engine.handle_datagram(datagram.from, datagram.data, now);
+            for (auto& node : nodes_)
+                if (node->address == datagram.to)
+                    node->engine.handle_datagram(datagram.from, datagram.data, now);
         }
 
-        for (auto& peer : peers_)
+        for (auto& node : nodes_)
         {
-            peer->engine.advance(now);
+            node->engine.advance(now);
 
             pzynet::transport::Transmit transmit;
-            while (peer->engine.poll_transmit(transmit))
+            while (node->engine.poll_transmit(transmit))
             {
-                Datagram datagram{peer->address, transmit.to, std::move(transmit.data), transmit.dont_fragment};
+                Datagram datagram{node->address, transmit.to, std::move(transmit.data), transmit.dont_fragment};
                 ++datagrams_sent;
                 if (tap)
                     tap(datagram);
+                if (drop && drop(datagram))
+                    continue;
                 if (datagram.data.size() + 28 > path_mtu)
                     continue; // too big for the path (RakNet's probes never rely on fragmentation)
                 if (chance(loss))
@@ -125,8 +129,8 @@ public:
             }
 
             pzynet::transport::Event event;
-            while (peer->engine.poll_event(event))
-                peer->events.push_back(std::move(event));
+            while (node->engine.poll_event(event))
+                node->events.push_back(std::move(event));
         }
     }
 
@@ -163,7 +167,7 @@ private:
         return std::chrono::microseconds(std::uniform_int_distribution<std::int64_t>(0, jitter.count())(random_));
     }
 
-    std::vector<std::unique_ptr<Peer>> peers_;
+    std::vector<std::unique_ptr<Node>> nodes_;
     std::multimap<pzynet::TimePoint, Datagram> in_flight_;
     std::mt19937 random_{20261115};
 };

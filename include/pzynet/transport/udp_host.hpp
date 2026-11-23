@@ -29,8 +29,13 @@ namespace transport
 class UdpHost
 {
 public:
-    /// The engine must outlive the host.
-    explicit UdpHost(Engine& engine) noexcept : engine_(engine) {}
+    /// The engine must outlive the host. `clock` supplies the time fed to the engine; empty means
+    /// Clock::now(). A different source (e.g. a skewed clock in tests) changes only the engine's view of
+    /// time, never how long the host's own calls wait.
+    explicit UdpHost(Engine& engine, ClockSource clock = ClockSource())
+        : engine_(engine), clock_(std::move(clock))
+    {
+    }
     ~UdpHost() { stop(); }
     UdpHost(const UdpHost&) = delete;
     UdpHost& operator=(const UdpHost&) = delete;
@@ -115,8 +120,10 @@ private:
     void notify() noexcept;    // makes the background thread re-evaluate the engine
     std::chrono::milliseconds wait_time(std::chrono::milliseconds cap, bool busy) const; // requires mutex_
     void run();
+    TimePoint now() const { return pzynet::now(clock_); }
 
     Engine& engine_;
+    ClockSource clock_;
     UdpSocket socket_;
     std::unique_ptr<Poller> poller_;
     std::vector<PollEvent> ready_;

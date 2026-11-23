@@ -47,7 +47,7 @@ void UdpHost::bind(const Endpoint& local, std::error_code& ec)
 
 bool UdpHost::pump()
 {
-    const TimePoint now = Clock::now();
+    const TimePoint now = this->now();
     bool received_any = false;
 
     for (int i = 0; i < max_datagrams_per_pump; ++i)
@@ -94,7 +94,7 @@ std::chrono::milliseconds UdpHost::wait_time(std::chrono::milliseconds cap, bool
     const std::optional<TimePoint> deadline = engine_.next_deadline();
     if (!deadline)
         return cap;
-    const TimePoint now = Clock::now();
+    const TimePoint now = this->now();
     milliseconds wait(0);
     if (*deadline > now)
         wait = std::chrono::duration_cast<milliseconds>(*deadline - now) + milliseconds(1); // round up
